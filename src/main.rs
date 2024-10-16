@@ -1,8 +1,9 @@
 use bendy::{decoding::FromBencode, encoding::ToBencode};
 use tokio::net::UdpSocket;
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::{SocketAddr, SocketAddrV4}, sync::Arc};
 
 mod proto;
+mod routing_table;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -14,21 +15,21 @@ async fn main() -> io::Result<()> {
         let mut buf = [0; 1024];
         loop {
             let (len, addr) = r.recv_from(&mut buf).await.unwrap();
-            let msg = proto::DHTResponse::from_bencode(&buf[..len]).unwrap();
+            let msg = proto::KRPCMessage::from_bencode(&buf[..len]).unwrap();
             println!("Received: {:?} from {:?}", msg, addr);
         }
     });
 
-
-   let ping = proto::DHTQueryPing {
-        payload: proto::DHTQueryPingPayload {
+    let ping = proto::KRPCMessage {
+        payload: proto::KRPCPayload::KRPCQueryPingRequest {
             id: proto::NodeId::generate(),
         },
-        transaction_id: 1000,
-        ip: Some(proto::Address {
-            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 35000),
-        }),
-        read_only: Some(1),
+        transaction_id: proto::Version { id: b"1234".to_vec() },
+        message_type: "q".to_string(),
+
+        ip: Some(proto::Address { addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080) } ),
+        
+        version: Some( proto::Version { id: b"NN40".to_vec() }),
     };
 
     println!("{:?}", ping);

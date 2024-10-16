@@ -1,4 +1,4 @@
-use bendy::encoding::{Error, SingleItemEncoder, ToBencode};
+use bendy::encoding::{Error, SingleItemEncoder, ToBencode, UnsortedDictEncoder};
 use bendy::decoding::FromBencode;
 use std::net::SocketAddrV4;
 use byteorder::{
@@ -10,7 +10,7 @@ use core::fmt;
 
 #[derive(PartialEq)]
 pub struct NodeId {
-    id: Vec<u8>,
+    pub id: Vec<u8>,
 }
 impl NodeId {
     pub fn generate() -> NodeId {
@@ -45,6 +45,20 @@ impl fmt::Debug for NodeId {
     }
 }
 
+//Info hashes are also just a byte array.
+pub type InfoHash = NodeId;
+
+//Version string is just a byte array.
+pub type Version = NodeId;
+
+//Transaction ID is also just a byte array.
+type TransactionId = NodeId;
+
+#[derive(Debug, PartialEq)]
+pub struct PeerInfo {
+    pub id: NodeId,
+    pub addr: Option<Address>,
+}
 
 #[derive(PartialEq)]
 pub struct Address {
@@ -97,8 +111,8 @@ impl fmt::Debug for Address {
 
 
 #[derive(PartialEq)]
-pub struct DHTError(u8, String);
-impl ToBencode for DHTError {
+pub struct KRPCError(u8, String);
+impl ToBencode for KRPCError {
     const MAX_DEPTH: usize = 1;
 
     fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
@@ -110,7 +124,7 @@ impl ToBencode for DHTError {
         })
     }
 }
-impl FromBencode for DHTError {
+impl FromBencode for KRPCError {
     fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
         let mut list = object.try_into_list()?;
 
@@ -120,15 +134,15 @@ impl FromBencode for DHTError {
         let message = list.next_object()?.ok_or(bendy::decoding::Error::missing_field("error_code"))?;
         let message = String::decode_bencode_object(message)?;
 
-        Ok(DHTError(error_code, message))
+        Ok(KRPCError(error_code, message))
     }
 }
-impl fmt::Display for DHTError {
+impl fmt::Display for KRPCError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         <Self as fmt::Debug>::fmt(self, f)
     }
 }
-impl fmt::Debug for DHTError {
+impl fmt::Debug for KRPCError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{{ code: {}, message: {} }}", self.0, self.1)
     }
@@ -136,187 +150,192 @@ impl fmt::Debug for DHTError {
 
 
 #[derive(Debug, PartialEq)]
-pub struct DHTQueryPing {
-    pub payload: DHTQueryPingPayload,
-    pub transaction_id: u32,
+pub struct KRPCMessage {
+    pub payload: KRPCPayload, //contents of 'a' or 'r' or 'e'
+    pub transaction_id: TransactionId,
+    pub message_type: String, //'r' or 'q' for 'y'
 
     pub ip: Option<Address>, //Optional IP of the sender
-    pub read_only: Option<u8>, //Optional read-only flag
+    pub version: Option<Version>, //Optional version string
 }
-impl ToBencode for DHTQueryPing {
-    const MAX_DEPTH: usize = 2;
+impl ToBencode for KRPCMessage {
+    const MAX_DEPTH: usize = 3;
 
     fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
         encoder.emit_unsorted_dict(|e| {
-            e.emit_pair(b"a", &self.payload)?;
-            e.emit_pair(b"q", "ping")?;
             e.emit_pair(b"t", &self.transaction_id)?;
-            e.emit_pair(b"y", "q")?;
+            e.emit_pair(b"y", &self.message_type)?;
+
+            match &self.payload {
+                KRPCPayload::KRPCQueryPingRequest { id } => {
+                    e.emit_pair(b"q", "ping")?;
+                    e.emit_pair(b"a", &self.payload)?;
+                },
+                KRPCPayload::KRPCQueryPingResponse { id, port } => {
+                    e.emit_pair(b"r", &id)?;
+
+                    if let Some(port) = port {
+                        e.emit_pair(b"port", port)?;
+                    }
+                },
+                KRPCPayload::KRPCError(error) => {
+                    e.emit_pair(b"e", error)?;
+                },
+            }
 
             if let Some(ip) = &self.ip {
                 e.emit_pair(b"ip", ip)?;
             }
 
-            if let Some(read_only) = &self.read_only {
-                e.emit_pair(b"ro", read_only)?;
+            if let Some(version) = &self.version {
+                e.emit_pair(b"v", version)?;
             }
 
             Ok(())
         })
+
     }
 }
-impl FromBencode for DHTQueryPing {
+impl FromBencode for KRPCMessage {
     fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
         let mut dict = object.try_into_dictionary()?;
 
-        let mut payload = None;
         let mut transaction_id = None;
+        let mut message_type = None;
+        let mut version = None;
+        let mut payload = None;
         let mut ip = None;
-        let mut read_only = None;
+
+        let mut q = None;
 
         while let Some(pair) = dict.next_pair()? {
             match pair {
-                (b"a", value) => {
-                    payload = Some(DHTQueryPingPayload::decode_bencode_object(value)?);
-                }
-                (b"q", value) => {
-                    Some(String::decode_bencode_object(value)?);
-                }
                 (b"t", value) => {
-                    transaction_id = Some(u32::decode_bencode_object(value)?);
-                }
+                    println!("t");
+                    transaction_id = Some(TransactionId::decode_bencode_object(value)?);
+                },
                 (b"y", value) => {
-                    Some(String::decode_bencode_object(value)?);
-                }
+                    println!("y");
+                    message_type = Some(String::decode_bencode_object(value)?);
+                },
+                (b"q", value) => {
+                    println!("q");
+                    q = Some(String::decode_bencode_object(value)?);
+                },
+                (b"a", value) => {
+                    println!("a");
+                    let mut dict = value.try_into_dictionary()?;
+
+                    //TODO check for other possible fields in 'a'
+                    let mut id = None;
+                   
+                    while let Some(pair) = dict.next_pair()? {
+                        match pair {
+                            (b"id", value) => {
+                                id = NodeId::decode_bencode_object(value).ok();
+                            },
+                            (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
+                        }
+                    }
+
+                    if id.is_some() {
+                        payload = Some(KRPCPayload::KRPCQueryPingRequest { id: id.unwrap() });
+                    }
+                    
+                },
+                (b"r", value) => {
+                    println!("r");
+
+                    let mut dict = value.try_into_dictionary()?;
+
+                    //TODO check for other possible fields in 'r'
+                    let mut id = None;
+                    let mut port: Option<u32> = None;
+
+                    while let Some(pair) = dict.next_pair()? {
+                        match pair {
+                            (b"id", value) => {
+                                id = NodeId::decode_bencode_object(value).ok();
+                            },
+                            (b"p", value) => {
+                                port = u32::decode_bencode_object(value).ok();
+                            },
+                            (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
+                        }
+                    }
+
+                    if id.is_some() {
+                        payload = Some(KRPCPayload::KRPCQueryPingResponse { id: id.unwrap(), port: port });
+                    }
+                },
+                (b"e", value) => {
+                    println!("e");
+                    let error = KRPCError::decode_bencode_object(value)?;
+                    payload = Some(KRPCPayload::KRPCError(error));
+                },
                 (b"ip", value) => {
+                    println!("ip");
                     ip = Some(Address::decode_bencode_object(value)?);
-                }
-                (b"ro", value) => {
-                    read_only = Some(u8::decode_bencode_object(value)?);
-                }
+                },
+                (b"v", value) => {
+                    println!("v");
+                    version = Version::decode_bencode_object(value).ok();
+                },
                 (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
             }
         }
 
-        Ok(DHTQueryPing {
-            payload: payload.unwrap(),
-            transaction_id: transaction_id.unwrap(),
-            ip,
-            read_only,
-        })
+        Ok((KRPCMessage{ payload: payload.unwrap(), transaction_id: transaction_id.unwrap(), message_type: message_type.unwrap(), ip, version }))
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DHTQueryPingPayload {
-    pub id: NodeId,
+pub enum KRPCPayload {
+    KRPCQueryPingRequest{
+        id: NodeId,
+
+    },
+    KRPCQueryPingResponse {
+        id: NodeId,
+        port: Option<u32>, //Why is port showing up?
+    },
+
+    KRPCError(KRPCError),
 }
-impl ToBencode for DHTQueryPingPayload {
-    const MAX_DEPTH: usize = 1;
+impl ToBencode for KRPCPayload {
+    const MAX_DEPTH: usize = 2;
 
     fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
-        encoder.emit_dict(|mut e| {
-            e.emit_pair(b"id", &self.id)?;
+        match self {
+            KRPCPayload::KRPCQueryPingRequest { id } => {
+                encoder.emit_dict(|mut e| {
+                    e.emit_pair(b"id", id)?;
 
-            Ok(())
-        })
-    }
-}
-impl FromBencode for DHTQueryPingPayload {
-    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
-        let mut dict = object.try_into_dictionary()?;
+                    Ok(())
+                })
+            },
+            KRPCPayload::KRPCQueryPingResponse { id, port } => {
+                encoder.emit_dict(|mut e| {
+                    e.emit_pair(b"id", id)?;
 
-        let mut id = None;
+                    if let Some(port) = port {
+                        e.emit_pair(b"port", port)?;
+                    }
 
-        while let Some(pair) = dict.next_pair()? {
-            match pair {
-                (b"id", value) => {
-                    id = Some(NodeId::decode_bencode_object(value)?);
-                }
-                (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
-            }
+                    Ok(())
+                })
+            },
+            KRPCPayload::KRPCError(error) => {
+                encoder.emit_dict(|mut e| {
+                    e.emit_pair(b"e", error)?;
+
+                    Ok(())
+                })
+            },
         }
-
-        Ok(DHTQueryPingPayload { id: id.unwrap() })
     }
 }
-#[derive(Debug, PartialEq)]
-pub struct DHTResponse {
-    pub transaction_id: Vec<u8>,
-    pub response: DHTResponsePayload,
-    pub ip: Option<Address>, //Optional IP of the sender
-    pub version: Option<Vec<u8>>, //Client version string
-}
-impl FromBencode for DHTResponse {
-    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
-        let mut dict = object.try_into_dictionary()?;
 
-        let mut transaction_id = None;
-        let mut response = None;
-        let mut ip = None;
-        let mut version = None;
-
-        while let Some(pair) = dict.next_pair()? {
-            match pair {
-                (b"t", value) => {
-                    let bytes = value.try_into_bytes()?;
-                    transaction_id = Some(bytes.to_vec());
-                }
-                (b"r", value) => {
-                    response = Some(DHTResponsePayload::decode_bencode_object(value)?);
-                }
-                (b"y", value) => {
-                    Some(String::decode_bencode_object(value)?);
-                }
-                (b"ip", value) => {
-                    ip = Some(Address::decode_bencode_object(value)?);
-                }
-                (b"v", value) => {
-                    let v = value.try_into_bytes()?;
-                    version = Some(v.to_vec());
-                }
-                (key, _) => {
-                    println!("unknown field, key: {:?}", key);
-                    return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string()))
-                }
-            }
-        }
-
-        Ok(DHTResponse {
-            transaction_id: transaction_id.unwrap(),
-            response: response.unwrap(),
-            ip,
-            version,
-        })
-    }
-}
-#[derive(Debug, PartialEq)]
-pub struct DHTResponsePayload {
-    pub id: NodeId,
-    pub port: Option<u16>,
-}
-impl FromBencode for DHTResponsePayload {
-    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
-        let mut dict = object.try_into_dictionary()?;
-
-        let mut id = None;
-        let mut port = None;
-
-        while let Some(pair) = dict.next_pair()? {
-            match pair {
-                (b"id", value) => {
-                    id = Some(NodeId::decode_bencode_object(value)?);
-                }
-                (b"p", value) => {
-                    port = Some(u16::decode_bencode_object(value)?);
-                }
-                (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
-            }
-        }
-
-        Ok(DHTResponsePayload { id: id.unwrap(), port })
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -324,37 +343,35 @@ mod tests {
 
     #[test]
     fn test_query_ping() {
-        let query = DHTQueryPing {
-            payload: DHTQueryPingPayload {
+        let ping = KRPCMessage {
+            payload: KRPCPayload::KRPCQueryPingRequest {
                 id: NodeId::generate(),
             },
-            transaction_id: 1,
-            ip: Some(Address {
-                addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080),
-            }),
-            read_only: Some(1),
+            transaction_id: TransactionId { id: b"1234".to_vec() },
+            message_type: "q".to_string(),
+    
+            ip: Some(Address { addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080) } ),
+            
+            version: Some( Version { id: b"NN40".to_vec() } ),
         };
 
-        let vecs = query.to_bencode().unwrap();
-        let decoded = DHTQueryPing::from_bencode(&vecs).unwrap();
+        let vecs = ping.to_bencode().unwrap();
+        let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
 
         println!("{:?}", decoded);
 
-        assert_eq!(query, decoded);
+        assert_eq!(ping, decoded);
     }
 
     #[test]
     fn test_ping_payload() {
-        let payload = DHTQueryPingPayload {
+        let payload = KRPCPayload::KRPCQueryPingRequest {
             id: NodeId::generate(),
         };
 
-        let vecs = payload.to_bencode().unwrap();
-        let decoded = DHTQueryPingPayload::from_bencode(&vecs).unwrap();
+        let _ = payload.to_bencode().unwrap();
 
-        println!("{:?}", decoded);
-
-        assert_eq!(payload, decoded);
+        //There's no FromBencode for Requests because the context of the parent object is required.
     }
 
     #[test]
@@ -373,9 +390,9 @@ mod tests {
 
     #[test]
     fn test_error() {
-        let error = DHTError(201, "Generic Error".to_string());
+        let error = KRPCError(201, "Generic Error".to_string());
         let vecs = error.to_bencode().unwrap();
-        let decoded = DHTError::from_bencode(&vecs).unwrap();
+        let decoded = KRPCError::from_bencode(&vecs).unwrap();
 
         println!("{:?}", decoded);
 
