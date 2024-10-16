@@ -24,12 +24,12 @@ async fn main() -> io::Result<()> {
         payload: proto::KRPCPayload::KRPCQueryPingRequest {
             id: proto::NodeId::generate(),
         },
-        transaction_id: proto::Version { id: b"1234".to_vec() },
+        transaction_id: proto::Version::new(b"1234".to_vec()),
         message_type: "q".to_string(),
 
         ip: Some(proto::Address { addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080) } ),
         
-        version: Some( proto::Version { id: b"NN40".to_vec() }),
+        version: Some( proto::Version::new(b"NN40".to_vec())),
     };
 
     println!("{:?}", ping);

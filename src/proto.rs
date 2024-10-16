@@ -9,50 +9,56 @@ use rand::Rng;
 use core::fmt;
 
 #[derive(PartialEq)]
-pub struct NodeId {
-    pub id: Vec<u8>,
-}
-impl NodeId {
-    pub fn generate() -> NodeId {
+pub struct ByteArray(Vec<u8>);
+
+impl ByteArray {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        ByteArray(bytes)
+    }
+
+    pub fn generate() -> ByteArray {
         let mut rng = rand::thread_rng();
         let mut id_bytes = vec![0u8; 20];
         rng.fill(&mut id_bytes[..]);
 
-        NodeId { id: id_bytes }
+        ByteArray(id_bytes)
     }
 }
-impl ToBencode for NodeId {
+impl ToBencode for ByteArray {
     const MAX_DEPTH: usize = 0;
 
     fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
-        encoder.emit_bytes(&self.id)
+        encoder.emit_bytes(&self.0)
     }
 }
-impl FromBencode for NodeId {
+impl FromBencode for ByteArray {
     fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
         let bytes = object.try_into_bytes()?;
-        Ok(NodeId { id: bytes.to_vec() })
+        Ok(ByteArray(bytes.to_vec()))
     }
 }
-impl fmt::Display for NodeId {
+impl fmt::Display for ByteArray {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         <Self as fmt::Debug>::fmt(self, f)
     }
 }
-impl fmt::Debug for NodeId {
+impl fmt::Debug for ByteArray {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{}", hex::encode(&self.id).to_ascii_uppercase())
+        write!(f, "0x{}", hex::encode(&self.0).to_ascii_uppercase())
     }
 }
 
+//Node ID is just a byte array.
+pub type NodeId = ByteArray;
+
 //Info hashes are also just a byte array.
-pub type InfoHash = NodeId;
+pub type InfoHash = ByteArray;
 
 //Version string is just a byte array.
-pub type Version = NodeId;
+pub type Version = ByteArray;
 
 //Transaction ID is also just a byte array.
-type TransactionId = NodeId;
+type TransactionId = ByteArray;
 
 #[derive(Debug, PartialEq)]
 pub struct PeerInfo {
@@ -206,24 +212,19 @@ impl FromBencode for KRPCMessage {
         let mut payload = None;
         let mut ip = None;
 
-        let mut q = None;
-
         while let Some(pair) = dict.next_pair()? {
             match pair {
                 (b"t", value) => {
-                    println!("t");
                     transaction_id = Some(TransactionId::decode_bencode_object(value)?);
                 },
                 (b"y", value) => {
-                    println!("y");
                     message_type = Some(String::decode_bencode_object(value)?);
                 },
                 (b"q", value) => {
-                    println!("q");
-                    q = Some(String::decode_bencode_object(value)?);
+                    //This does literally nothing, we can't use it to determine payload type because it shows up after.
+                    let _ = Some(String::decode_bencode_object(value)?);
                 },
                 (b"a", value) => {
-                    println!("a");
                     let mut dict = value.try_into_dictionary()?;
 
                     //TODO check for other possible fields in 'a'
@@ -244,8 +245,6 @@ impl FromBencode for KRPCMessage {
                     
                 },
                 (b"r", value) => {
-                    println!("r");
-
                     let mut dict = value.try_into_dictionary()?;
 
                     //TODO check for other possible fields in 'r'
@@ -269,16 +268,13 @@ impl FromBencode for KRPCMessage {
                     }
                 },
                 (b"e", value) => {
-                    println!("e");
                     let error = KRPCError::decode_bencode_object(value)?;
                     payload = Some(KRPCPayload::KRPCError(error));
                 },
                 (b"ip", value) => {
-                    println!("ip");
                     ip = Some(Address::decode_bencode_object(value)?);
                 },
                 (b"v", value) => {
-                    println!("v");
                     version = Version::decode_bencode_object(value).ok();
                 },
                 (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
@@ -347,12 +343,12 @@ mod tests {
             payload: KRPCPayload::KRPCQueryPingRequest {
                 id: NodeId::generate(),
             },
-            transaction_id: TransactionId { id: b"1234".to_vec() },
+            transaction_id: TransactionId::new(b"1234".to_vec()),
             message_type: "q".to_string(),
     
             ip: Some(Address { addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080) } ),
             
-            version: Some( Version { id: b"NN40".to_vec() } ),
+            version: Some( Version::new(b"NN40".to_vec())),
         };
 
         let vecs = ping.to_bencode().unwrap();
