@@ -10,3 +10,5 @@ rand = "*"
 byteorder = "*"
 bendy = "*"
 num-bigint = "*"
+log = "*"
+simplelog = { version = "*", features = ["paris"] }
