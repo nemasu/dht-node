@@ -69,6 +69,8 @@ pub type TransactionId = ByteArray;
 
 pub type Token = ByteArray;
 
+pub type CompactIp = ByteArray;
+
 #[derive(PartialEq, Eq, Hash)]
 pub struct CompactAddress {
     pub addr: SocketAddrV4,
@@ -190,7 +192,7 @@ impl FromBencode for CompactNodeList {
 
             nodes.push(CompactNode { id, addr });
 
-            if bytes.is_empty() {
+            if bytes.is_empty() || bytes.len() < 26 {
                 break;
             }
         }
@@ -291,7 +293,7 @@ pub struct KRPCMessage {
     pub message_type: String, //'r' or 'q' for 'y'
     pub query: Option<String>, //The query type, 'ping', 'find_node', 'get_peers', 'announce_peer'
 
-    pub ip: Option<CompactAddress>, //Optional IP of the sender
+    pub ip: Option<CompactAddress>, //Optional IP of the sender. For ping response, this is the IP and port of the sender.
     pub version: Option<Version>, //Optional version string
 }
 
@@ -320,6 +322,7 @@ impl KRPCMessage {
             payload: KRPCPayload::KRPCQueryIdResponse {
                 id: node_id,
                 port: None,
+                ip: None,
             },
             transaction_id: transaction_id,
             message_type: "r".to_string(),
@@ -343,7 +346,7 @@ impl KRPCMessage {
         }
     }
 
-    pub fn get_peers_response(node_id: NodeId, token: Token, nodes: CompactNodeList, transaction_id: TransactionId, values: Option<Vec<CompactNode>>) -> Self {
+    pub fn get_peers_response(node_id: NodeId, token: Token, nodes: CompactNodeList, transaction_id: TransactionId, values: Option<Vec<CompactAddress>>) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryGetPeersResponse {
                 id: node_id,
@@ -377,6 +380,7 @@ impl KRPCMessage {
             payload: KRPCPayload::KRPCQueryIdResponse {
                 id: node_id,
                 port: None,
+                ip: None,
             },
             transaction_id: transaction_id.clone(),
             message_type: "r".to_string(),
@@ -400,7 +404,7 @@ impl ToBencode for KRPCMessage {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryIdResponse { id: _, port: _ } => {
+                KRPCPayload::KRPCQueryIdResponse { id: _, port: _, ip: _} => {
                     e.emit_pair(b"r", &self.payload)?;
                 },
                 KRPCPayload::KRPCError(error) => {
@@ -509,6 +513,7 @@ impl FromBencode for KRPCMessage {
                     let mut token = None;
                     let mut nodes = None;
                     let mut values = None;
+                    let mut ip = None;
 
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
@@ -525,7 +530,10 @@ impl FromBencode for KRPCMessage {
                                 nodes = CompactNodeList::decode_bencode_object(value).ok();
                             },
                             (b"values", value) => {
-                                values = Vec::<CompactNode>::decode_bencode_object(value).unwrap().into();
+                                values = Vec::<CompactAddress>::decode_bencode_object(value).unwrap().into();
+                            }
+                            (b"ip", value) => {
+                                ip = CompactIp::decode_bencode_object(value).unwrap().into();
                             }
                             //TODO add more potential response fields here
                             (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
@@ -535,9 +543,9 @@ impl FromBencode for KRPCMessage {
                     //We determine the payload type based off the arguments present.
                     //Other libraries do this too using #[serde(untagged)]
                     if id.is_some() && token.is_some() && (nodes.is_some() || values.is_some()) {
-                        payload = Some(KRPCPayload::KRPCQueryGetPeersResponse { id: id.unwrap(), token: token.unwrap(), nodes: nodes, values: None });
+                        payload = Some(KRPCPayload::KRPCQueryGetPeersResponse { id: id.unwrap(), token: token.unwrap(), nodes: nodes, values: values });
                     } else if id.is_some() {
-                        payload = Some(KRPCPayload::KRPCQueryIdResponse { id: id.unwrap(), port });
+                        payload = Some(KRPCPayload::KRPCQueryIdResponse { id: id.unwrap(), port, ip });
                     }
                 },
                 (b"e", value) => {
@@ -554,7 +562,11 @@ impl FromBencode for KRPCMessage {
             }
         }
 
-        Ok(KRPCMessage{ payload: payload.unwrap(), transaction_id: transaction_id.unwrap(), message_type: message_type.unwrap(), ip, version, query })
+        if payload.is_some() && transaction_id.is_some() && message_type.is_some() {
+            Ok(KRPCMessage{ payload: payload.unwrap(), transaction_id: transaction_id.unwrap(), message_type: message_type.unwrap(), ip, version, query })
+        } else {
+            Err(bendy::decoding::Error::missing_field("payload, transaction_id, or message_type"))
+        }
     }
 }
 
@@ -567,7 +579,8 @@ pub enum KRPCPayload {
     //Used for ping and announce_peer responses
     KRPCQueryIdResponse {
         id: NodeId,
-        port: Option<u32>, //Why is port showing up?
+        port: Option<u32>, //Appears to be the port that they received the request on
+        ip: Option<CompactIp>,//Sometimes the IP shows up here
     },
 
     KRPCQueryGetPeersRequest {
@@ -578,7 +591,7 @@ pub enum KRPCPayload {
         id: NodeId,
         token: ByteArray,
         nodes: Option<CompactNodeList>,
-        values: Option<Vec<CompactNode>>, //Why this is a list and nodes isn't is a mystery.
+        values: Option<Vec<CompactAddress>>, //Why this is a list and nodes isn't is a mystery.
     },
 
     KRPCQueryAnnouncePeerRequest {
@@ -604,12 +617,16 @@ impl ToBencode for KRPCPayload {
                     Ok(())
                 })
             },
-            KRPCPayload::KRPCQueryIdResponse { id, port } => {
+            KRPCPayload::KRPCQueryIdResponse { id, port, ip } => {
                 encoder.emit_unsorted_dict(|e| {
                     e.emit_pair(b"id", id)?;
 
                     if let Some(port) = port {
                         e.emit_pair(b"port", port)?;
+                    }
+
+                    if let Some(ip) = ip {
+                        e.emit_pair(b"ip", ip)?;
                     }
 
                     Ok(())
@@ -671,6 +688,18 @@ impl ToBencode for KRPCPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_real_find_node() {
+        let hex_str = "64313a6164323a696432303a38383838383838384964cd1f98f78de3c8a4fd51363a74617267657432303ad1b6caac6bfe42fc9592a6299d2f7986d4cfc50f65313a71393a66696e645f6e6f6465313a74343a666e0000313a76343a34423f77313a79313a7165";
+    }
+
+    #[test]
+    fn test_real_get_peers_with_values() {
+        let hex_str = "64313a7264323a696432303a505e3263273333913f5236c25cb1f7a2246d22d3353a746f6b656e323a6778363a76616c7565736c363ac39ab5e1d6cf6565313a74343a00000181313a79313a7265";
+        let vecs = hex::decode(hex_str).unwrap();
+        let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
+        println!("{:?}", decoded);
+    }
 
     #[test]
     fn test_real_announce_peer() {

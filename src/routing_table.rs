@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::thread::current;
 
 use crate::proto::{self, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token};
 
@@ -19,7 +20,8 @@ pub struct RoutingTable {
     //Map of node to generated tokens
     pub sent_tokens: HashMap<NodeId, HashSet<Token>>,
 
-    pub pinged_nodes: HashMap<NodeId, u32>,
+    //Node -> (last heard from, last pinged)
+    pub nodes_time: HashMap<NodeId, (u64,u64)>,
 }
 
 impl RoutingTable {
@@ -30,7 +32,7 @@ impl RoutingTable {
             self.info_hashes.len(),
             self.sent_tokens.len(),
             self.tokens.len(),
-            self.pinged_nodes.len()
+            self.nodes_time.len()
         );
     }
 
@@ -58,29 +60,50 @@ impl RoutingTable {
             info_hashes: HashMap::new(),
             tokens: HashMap::new(),
             sent_tokens: HashMap::new(),
-            pinged_nodes: HashMap::new(),
+            nodes_time: HashMap::new(),
         }
     }
 
-    pub fn ping_expect_response(&mut self, node_id: &NodeId) {
-        //Insert node_id and current time
-        self.pinged_nodes.insert(node_id.clone(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32);
-    }
-
-    pub fn ping_get(&mut self, node_id: &NodeId) {
-        if self.pinged_nodes.contains_key(node_id) {
-            self.pinged_nodes.remove(node_id);
+    pub fn node_time_update(&mut self, node_id: &NodeId) {
+        //Insert/update node_id and current time
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if let Some(value) = self.nodes_time.get_mut(node_id)  {
+            value.0 = current_time;
+        } else {
+            let time = (current_time, current_time);
+            self.nodes_time.insert(node_id.clone(), time);
         }
     }
 
-    pub fn ping_remove_dead(&mut self) {
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+    pub fn node_get_for_ping(&self) -> Vec<CompactNode> {
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut nodes_to_ping = Vec::new();
+        for (node_id, addr) in &self.nodes {
+            if let Some(time) = self.nodes_time.get(node_id) {
+                //Ping node if it has not communicated in 60 seconds, and it has not been pinged in the last 10 seconds
+                if (current_time as i64 - time.0 as i64) > 60 && (current_time as i64 - time.1 as i64) > 10 {
+                    nodes_to_ping.push(CompactNode::new(node_id.clone(), addr.clone()));
+                }
+            }
+        }
+        nodes_to_ping
+    }
 
+    pub fn ping_update(&mut self, node_id: &NodeId) {
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if let Some(time) = self.nodes_time.get_mut(node_id) {
+            time.1 = current_time;
+        }
+    }
+
+    pub fn node_remove_dead(&mut self) {
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let mut nodes_to_remove = Vec::new();
 
-        for (node_id, time) in &self.pinged_nodes {
-            if current_time - time > 10 {
-                debug!("Node {} / {} has not responded to ping. Now: {}", node_id, time, current_time);
+        for (node_id, time) in &self.nodes_time {
+            //Remove node if it has not responded in 85 seconds
+            if current_time as i64 - time.0 as i64 > 85 {
+                debug!("Node {} has not responded. Last message @ {}, last ping @ {}", node_id, time.0, time.1);
                 nodes_to_remove.push(node_id.clone());
             }
         }
@@ -102,12 +125,14 @@ impl RoutingTable {
 
             self.sent_tokens.remove(&node_id);
 
-            self.pinged_nodes.remove(&node_id);
+            self.nodes_time.remove(&node_id);
         }
     }
 
     pub fn get_node_list_for_info_hash(&self, info_hash: &InfoHash) -> CompactNodeList {
         let mut node_list = Vec::new();
+
+        //TODO calculate closest nodes to respond with if we don't have the info_hash
 
         if let Some(node_set) = self.get_info_hash(info_hash) {
             for node_id in node_set {
@@ -121,6 +146,7 @@ impl RoutingTable {
     }
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
+        self.node_time_update(&node_id);
         self.nodes.insert(node_id, addr);
     }
 
@@ -142,7 +168,32 @@ impl RoutingTable {
         node_list
     }
 
+    pub fn get_random_nodes(&self, amount: usize) -> Vec<CompactNode> {
+        let mut rng = rand::thread_rng();
+        let mut node_list = Vec::new();
+
+        //Get amount number of random nodes from node_list
+
+        //Generate amount number of random indexes between 0 and node_list.len()
+        let node_list_len = self.nodes.len();
+        let mut indexes: Vec<usize> = Vec::new();
+        while indexes.len() < amount && indexes.len() < node_list_len {
+            let index = rand::Rng::gen_range(&mut rng, 0..node_list_len);
+            if !indexes.contains(&index) {
+                indexes.push(index);
+            }
+        }
+        
+        for index in indexes {
+            let (node_id, addr) = self.nodes.iter().nth(index).unwrap();
+            node_list.push(CompactNode::new(node_id.clone(), addr.clone()));
+        }
+
+        node_list
+    }
+
     pub fn add_info_hash(&mut self, info_hash: InfoHash, node_id: NodeId) {
+        self.node_time_update(&node_id);
         let node_set = self.info_hashes.entry(info_hash).or_insert(HashSet::new());
         node_set.insert(node_id);
     }
@@ -158,6 +209,7 @@ impl RoutingTable {
     }
 
     pub fn add_token(&mut self, node_id: NodeId, token: Token) {
+        self.node_time_update(&node_id);
         self.tokens.insert(node_id, token);
     }
 
@@ -174,6 +226,7 @@ impl RoutingTable {
     }
 
     pub fn add_sent_token(&mut self, node_id: &NodeId, token: Token) {
+        self.node_time_update(&node_id);
         let token_set = self.sent_tokens.entry(node_id.clone()).or_insert(HashSet::new());
         token_set.insert(token);
     }
@@ -194,29 +247,6 @@ mod tests {
     use std::net::SocketAddrV4;
 
     use super::*;
-
-    #[test]
-    fn test_ping_management() {
-        let mut routing_table = RoutingTable::new();
-
-        let node_id = NodeId::generate_nodeid();
-        let addr: SocketAddrV4 = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881);
-        let compact_addr = CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(addr));
-
-        routing_table.add_node(node_id.clone(), compact_addr.clone());
-
-        routing_table.ping_expect_response(&node_id);
-
-        routing_table.ping_remove_dead();
-
-        assert_eq!(routing_table.pinged_nodes.len(), 1);
-
-        std::thread::sleep(std::time::Duration::from_secs(11));
-
-        routing_table.ping_remove_dead();
-
-        assert_eq!(routing_table.pinged_nodes.len(), 0);
-    }
 
     #[test]
     fn test_routing_table() {

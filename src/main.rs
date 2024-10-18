@@ -14,7 +14,7 @@ async fn main() -> io::Result<()> {
     TermLogger::init(LevelFilter::Debug, Config::default(), TerminalMode::Mixed, ColorChoice::Auto).unwrap();
 
     let mut addr: Option<String> = None;
-    
+
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.get(0).map(|r| r.deref()) {
         Some(p)=>{
@@ -42,8 +42,7 @@ async fn main() -> io::Result<()> {
         let mut buf = [0; 1024];
         loop {
             trace!("Routing Table: {:?}", inner_routing_table);
-            inner_routing_table.lock().await.debug_stats();
-
+            
             let (len, addr) = r.recv_from(&mut buf).await.unwrap();
             
             let _  = match proto::KRPCMessage::from_bencode(&buf[..len]) {
@@ -57,12 +56,12 @@ async fn main() -> io::Result<()> {
                                 "ping" => {
                                     //Add node to routing table
                                     if let KRPCPayload::KRPCQueryPingRequest{ id } = msg.payload {
-                                        inner_routing_table.lock().await.add_node(id, CompactAddress::new_from_sockaddr(addr));
+                                        inner_routing_table.lock().await.ping_update(&id.clone());
 
                                         //Response
                                         let ping_response = proto::KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
                                         
-                                        trace!("ping response: {:?}", ping_response);
+                                        trace!("sending ping response: {:?}", ping_response);
                                         
                                         inner_s.send_to(&ping_response.to_bencode().unwrap(), addr).await.unwrap();
                                     }
@@ -74,7 +73,6 @@ async fn main() -> io::Result<()> {
                                         inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
                                         
                                         //Officially we should only be tracking 8 nodes, but for now we will track all nodes
-                                        //TODO calculate closest nodes
                                         let nodes = inner_routing_table.lock().await.get_node_list_for_info_hash(&info_hash);
                                         
                                         let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
@@ -84,7 +82,7 @@ async fn main() -> io::Result<()> {
                                         //Response
                                         let get_peers_response = KRPCMessage::get_peers_response(inner_node_id.clone(), token, nodes, msg.transaction_id, None);
 
-                                        debug!("get_peers response: {:?}", get_peers_response);
+                                        trace!("sending get_peers response: {:?}", get_peers_response);
 
                                         inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
                                     }
@@ -106,7 +104,7 @@ async fn main() -> io::Result<()> {
                                         //Response
                                         let get_peers_response = KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
 
-                                        debug!("get_peers response: {:?}", get_peers_response);
+                                        debug!("sending annouce_peers response: {:?}", get_peers_response);
 
                                         //TODO implied_port
                                         inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
@@ -120,10 +118,27 @@ async fn main() -> io::Result<()> {
                         "r" => {
                             match msg.payload {
                                 //TODO check the transaction id
-                                KRPCPayload::KRPCQueryIdResponse { id, port } => {
+                                KRPCPayload::KRPCQueryIdResponse { id, port: _, ip: _ } => {
                                     //Add node to routing table
                                     inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                    inner_routing_table.lock().await.ping_get(&id);
+                                }
+                                KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values: values } => {
+                                    //Add node to routing table
+                                    inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                    inner_routing_table.lock().await.add_token(id.clone(), token.clone());
+
+                                    //Add nodes to routing table
+                                    trace!("get_peers response from {:?}. Nodes: {:?}", id, nodes);
+                                    if nodes.is_some() {
+                                        for node in nodes.unwrap().0 {
+                                            inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
+                                        }
+                                    }
+
+                                    if values.is_some() {
+                                       //TODO
+                                       //There's no node_id, so we need to ping these addresses to get them
+                                    }
                                 }
                                 _ => {
                                     warn!("Unimplemented response type: {:?}", msg.payload);
@@ -169,19 +184,37 @@ async fn main() -> io::Result<()> {
     }
 
     loop {
-        //Every x seconds, ping all nodes in the routing table
-        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        //Remove dead nodes
-        routing_table.lock().await.ping_remove_dead();
+        if current_time % 10 == 0 {
+            routing_table.lock().await.debug_stats();
+        }
 
-        let nodes = routing_table.lock().await.get_all_nodes();
+        //Node management
+        routing_table.lock().await.node_remove_dead();
+
+        let nodes = routing_table.lock().await.node_get_for_ping();
         for node in nodes {
-            let ping = proto::KRPCMessage::ping(node.id.clone(), proto::TransactionId::new_from_i32(transaction_counter));
+            let ping = proto::KRPCMessage::ping(node_id.clone(), proto::TransactionId::new_from_i32(transaction_counter));
             transaction_counter += 1;
             s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await?;
-            routing_table.lock().await.ping_expect_response(&node.id);
-            trace!("{:?}", ping);
+            routing_table.lock().await.node_time_update(&node.id);
+            trace!("Pinging {:?}", ping);
+        }
+
+        //Get more nodes via get_peers every 30 seconds
+        //from 5 random nodes for now
+        if current_time % 30 == 0 {
+            let nodes = routing_table.lock().await.get_random_nodes(5);
+            for node in nodes {
+                let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), proto::InfoHash::generate(20), proto::TransactionId::new_from_i32(transaction_counter));
+                transaction_counter += 1;
+                s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await?;
+                routing_table.lock().await.node_time_update(&node.id);
+                trace!("get_peers {:?}", get_peers);
+            }
         }
     }
 }
