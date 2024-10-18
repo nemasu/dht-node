@@ -72,7 +72,6 @@ async fn main() -> io::Result<()> {
                                         //Add node to routing table
                                         inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
                                         
-                                        //Officially we should only be tracking 8 nodes, but for now we will track all nodes
                                         let nodes = inner_routing_table.lock().await.get_node_list_for_info_hash(&info_hash);
                                         
                                         let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
@@ -110,6 +109,22 @@ async fn main() -> io::Result<()> {
                                         inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
                                     }
                                 }
+                                "find_node" => {
+                                    if let KRPCPayload::KRPCQueryFindNodeRequest{ id, target } = msg.payload {
+                                        //Add node to routing table
+                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                        
+                                        //Find nodes
+                                        let nodes = inner_routing_table.lock().await.get_node_list_for_node_id(&id);
+                                        
+                                        //Response
+                                        let find_node_response = KRPCMessage::find_node_response(inner_node_id.clone(), nodes, msg.transaction_id);
+
+                                        trace!("sending find_node response: {:?}", find_node_response);
+
+                                        inner_s.send_to(&find_node_response.to_bencode().unwrap(), addr).await.unwrap();
+                                    }
+                                }
                                 q => {
                                     warn!("Unknown query type: {:?}", q);
                                 }
@@ -138,6 +153,16 @@ async fn main() -> io::Result<()> {
                                     if values.is_some() {
                                        //TODO
                                        //There's no node_id, so we need to ping these addresses to get them
+                                    }
+                                }
+                                KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
+                                    //Add node to routing table
+                                    inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+
+                                    //Add nodes to routing table
+                                    trace!("find_node response from {:?}. Nodes: {:?}", id, nodes);
+                                    for node in nodes.0 {
+                                        inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
                                     }
                                 }
                                 _ => {
@@ -169,7 +194,7 @@ async fn main() -> io::Result<()> {
     });
 
     
-    //Initial pings
+    //Initial get_peers
     //read in a file, and loop for every line
     let file = std::fs::File::open("nodes.txt").unwrap();
     let mut transaction_counter: i32 = 0;
@@ -177,10 +202,10 @@ async fn main() -> io::Result<()> {
         let addr = line.unwrap();
         let addr = addr.trim();
         let addr = addr.parse::<SocketAddr>().unwrap();
-        let ping = proto::KRPCMessage::ping(node_id.clone(), proto::TransactionId::new_from_i32(transaction_counter));
+        let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), proto::InfoHash::generate(20), proto::TransactionId::new_from_i32(transaction_counter));
         transaction_counter += 1;
-        s.send_to(&ping.to_bencode().unwrap(), addr).await?;
-        trace!("{:?}", ping);
+        s.send_to(&get_peers.to_bencode().unwrap(), addr).await?;
+        trace!("{:?}", get_peers);
     }
 
     loop {
@@ -195,24 +220,24 @@ async fn main() -> io::Result<()> {
         //Node management
         routing_table.lock().await.node_remove_dead();
 
+        //Pings
         let nodes = routing_table.lock().await.node_get_for_ping();
         for node in nodes {
             let ping = proto::KRPCMessage::ping(node_id.clone(), proto::TransactionId::new_from_i32(transaction_counter));
             transaction_counter += 1;
             s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await?;
-            routing_table.lock().await.node_time_update(&node.id);
+            routing_table.lock().await.ping_update(&node.id);
             trace!("Pinging {:?}", ping);
         }
 
         //Get more nodes via get_peers every 30 seconds
-        //from 5 random nodes for now
+        //from 10 random nodes for now
         if current_time % 30 == 0 {
-            let nodes = routing_table.lock().await.get_random_nodes(5);
+            let nodes = routing_table.lock().await.get_random_nodes(10);
             for node in nodes {
                 let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), proto::InfoHash::generate(20), proto::TransactionId::new_from_i32(transaction_counter));
                 transaction_counter += 1;
                 s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await?;
-                routing_table.lock().await.node_time_update(&node.id);
                 trace!("get_peers {:?}", get_peers);
             }
         }

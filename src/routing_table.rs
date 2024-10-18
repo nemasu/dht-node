@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::thread::current;
 
 use crate::proto::{self, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, warn, trace};
 
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
@@ -14,10 +13,10 @@ pub struct RoutingTable {
     //Map of info_hash to node list
     pub info_hashes: HashMap<InfoHash, HashSet<NodeId>>,
 
-    //Map of node to announce_peer token recv'd by get_peers query.
+    //Map of node to get_peer response
     pub tokens: HashMap<NodeId, Token>,
 
-    //Map of node to generated tokens
+    //Map of node to generated tokens sent 
     pub sent_tokens: HashMap<NodeId, HashSet<Token>>,
 
     //Node -> (last heard from, last pinged)
@@ -80,8 +79,8 @@ impl RoutingTable {
         let mut nodes_to_ping = Vec::new();
         for (node_id, addr) in &self.nodes {
             if let Some(time) = self.nodes_time.get(node_id) {
-                //Ping node if it has not communicated in 60 seconds, and it has not been pinged in the last 10 seconds
-                if (current_time as i64 - time.0 as i64) > 60 && (current_time as i64 - time.1 as i64) > 10 {
+                //Ping node if it has not communicated in 11 minutes, and it has not been pinged in the last minute
+                if (current_time as i64 - time.0 as i64) > (60*11) && (current_time as i64 - time.1 as i64) > 60 {
                     nodes_to_ping.push(CompactNode::new(node_id.clone(), addr.clone()));
                 }
             }
@@ -101,9 +100,9 @@ impl RoutingTable {
         let mut nodes_to_remove = Vec::new();
 
         for (node_id, time) in &self.nodes_time {
-            //Remove node if it has not responded in 85 seconds
-            if current_time as i64 - time.0 as i64 > 85 {
-                debug!("Node {} has not responded. Last message @ {}, last ping @ {}", node_id, time.0, time.1);
+            //Remove node if it has not responded in 15  minutes
+            if current_time as i64 - time.0 as i64 > (60*15) {
+                trace!("Node {} has not responded. Last message @ {}, last ping @ {}", node_id, time.0, time.1);
                 nodes_to_remove.push(node_id.clone());
             }
         }
@@ -129,10 +128,9 @@ impl RoutingTable {
         }
     }
 
+    //used for get_peers response
     pub fn get_node_list_for_info_hash(&self, info_hash: &InfoHash) -> CompactNodeList {
         let mut node_list = Vec::new();
-
-        //TODO calculate closest nodes to respond with if we don't have the info_hash
 
         if let Some(node_set) = self.get_info_hash(info_hash) {
             for node_id in node_set {
@@ -141,9 +139,31 @@ impl RoutingTable {
                 }
             }
         }
-        
+
+        //TODO calculate closest nodes to respond with if we don't have the info_hash
+        //Random for now
+        while node_list.len() < 8 {
+            let random_node = self.get_random_nodes(1);
+            node_list.push(random_node[0].clone());
+        }
+                
         CompactNodeList::new_from_vec(node_list)
     }
+
+    //used for find_node response
+    pub fn get_node_list_for_node_id(&self, node_id: &NodeId) -> CompactNodeList {
+        let mut node_list = Vec::new();
+
+        //TODO calculate closest nodes to respond with
+        //Random for now
+        while node_list.len() < 8 {
+            let random_node = self.get_random_nodes(1);
+            node_list.push(random_node[0].clone());
+        }
+                
+        CompactNodeList::new_from_vec(node_list)
+    }
+    
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
         self.node_time_update(&node_id);

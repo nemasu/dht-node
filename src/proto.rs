@@ -183,6 +183,10 @@ impl FromBencode for CompactNodeList {
         let bytes = object.try_into_bytes()?;
         let mut bytes = bytes.to_vec();
 
+        if bytes.len() < 26 {
+            return Err(bendy::decoding::Error::unexpected_field("CompactNodeList is empty/too short."));
+        }
+
         loop {
             let node_bytes = bytes.drain(0..20).collect();
             let addr_bytes = bytes.drain(0..6).collect();
@@ -193,6 +197,7 @@ impl FromBencode for CompactNodeList {
             nodes.push(CompactNode { id, addr });
 
             if bytes.is_empty() || bytes.len() < 26 {
+                warn!("CompactNodeList too short");
                 break;
             }
         }
@@ -237,6 +242,10 @@ impl ToBencode for CompactNode {
 impl FromBencode for CompactNode {
     fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
         let mut bytes = object.try_into_bytes().unwrap().to_vec();
+
+        if bytes.len() < 20 {
+            return Err(bendy::decoding::Error::unexpected_field("CompactNode is too short/empty."));
+        }
 
         let addr_bytes = bytes.split_off(20).to_vec();
 
@@ -298,6 +307,33 @@ pub struct KRPCMessage {
 }
 
 impl KRPCMessage {
+    pub fn find_node(node_id: NodeId, target: NodeId, transaction_id: TransactionId) -> Self {
+        KRPCMessage {
+            payload: KRPCPayload::KRPCQueryFindNodeRequest {
+                id: node_id,
+                target: target,
+            },
+            transaction_id: transaction_id,
+            message_type: "q".to_string(),
+            query: Some("find_node".to_string()),
+            ip: None,
+            version: None,
+        }
+    }
+
+    pub fn find_node_response(node_id: NodeId, nodes: CompactNodeList, transaction_id: TransactionId) -> Self {
+        KRPCMessage {
+            payload: KRPCPayload::KRPCQueryFindNodeResponse {
+                id: node_id,
+                nodes: nodes,
+            },
+            transaction_id: transaction_id,
+            message_type: "r".to_string(),
+            query: None,
+            ip: None,
+            version: None,
+        }
+    }
 
     pub fn announce_peer(node_id: NodeId, info_hash: InfoHash, token: Token, port: u32, transaction_id: TransactionId) -> Self{
         KRPCMessage {
@@ -421,6 +457,13 @@ impl ToBencode for KRPCMessage {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
+                KRPCPayload::KRPCQueryFindNodeRequest { id: _, target: _ } => {
+                    e.emit_pair(b"q", self.query.clone().unwrap())?;
+                    e.emit_pair(b"a", &self.payload)?;
+                },
+                KRPCPayload::KRPCQueryFindNodeResponse { id: _, nodes: _ } => {
+                    e.emit_pair(b"r", &self.payload)?;
+                },
             }
 
             if let Some(ip) = &self.ip {
@@ -468,6 +511,8 @@ impl FromBencode for KRPCMessage {
                     let mut port = None;
                     let mut implied_port = None;
                     let mut seed = None;
+
+                    let mut target = None;
                    
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
@@ -489,6 +534,9 @@ impl FromBencode for KRPCMessage {
                             (b"seed", value) => {
                                 seed = u32::decode_bencode_object(value).ok();
                             },
+                            (b"target", value) => {
+                                target = NodeId::decode_bencode_object(value).ok();
+                            },
                             //TODO add more potential request fields here
                             (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
                         }
@@ -498,6 +546,8 @@ impl FromBencode for KRPCMessage {
                     //Other libraries do this too using #[serde(untagged)] 
                     if id.is_some() && info_hash.is_some() && token.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryAnnouncePeerRequest { id: id.unwrap(), info_hash: info_hash.unwrap(), token: token.unwrap(), port: port.unwrap(), implied_port, seed});
+                    } else if id.is_some() && target.is_some() {
+                        payload = Some(KRPCPayload::KRPCQueryFindNodeRequest { id: id.unwrap(), target: target.unwrap() });
                     } else if info_hash.is_some() && id.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryGetPeersRequest { id: id.unwrap(), info_hash: info_hash.unwrap() });
                     } else if id.is_some() {
@@ -544,6 +594,8 @@ impl FromBencode for KRPCMessage {
                     //Other libraries do this too using #[serde(untagged)]
                     if id.is_some() && token.is_some() && (nodes.is_some() || values.is_some()) {
                         payload = Some(KRPCPayload::KRPCQueryGetPeersResponse { id: id.unwrap(), token: token.unwrap(), nodes: nodes, values: values });
+                    } else if id.is_some() && nodes.is_some() {
+                        payload = Some(KRPCPayload::KRPCQueryFindNodeResponse { id: id.unwrap(), nodes: nodes.unwrap() });
                     } else if id.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryIdResponse { id: id.unwrap(), port, ip });
                     }
@@ -601,6 +653,15 @@ pub enum KRPCPayload {
         port: u32,
         implied_port: Option<u32>,
         seed: Option<u32>, //Not sure what this is yet
+    },
+
+    KRPCQueryFindNodeRequest {
+        id: NodeId,
+        target: NodeId,
+    },
+    KRPCQueryFindNodeResponse {
+        id: NodeId,
+        nodes: CompactNodeList,
     },
 
     KRPCError(KRPCError),
@@ -680,6 +741,22 @@ impl ToBencode for KRPCPayload {
                     Ok(())
                 })
             },
+            KRPCPayload::KRPCQueryFindNodeRequest { id, target } => {
+                encoder.emit_unsorted_dict(|e| {
+                    e.emit_pair(b"id", id)?;
+                    e.emit_pair(b"target", target)?;
+
+                    Ok(())
+                })
+            },
+            KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
+                encoder.emit_unsorted_dict(|e| {
+                    e.emit_pair(b"id", id)?;
+                    e.emit_pair(b"nodes", nodes)?;
+
+                    Ok(())
+                })
+            },
         }
     }
 }
@@ -689,8 +766,12 @@ impl ToBencode for KRPCPayload {
 mod tests {
     use super::*;
 
+    #[test]
     fn test_real_find_node() {
         let hex_str = "64313a6164323a696432303a38383838383838384964cd1f98f78de3c8a4fd51363a74617267657432303ad1b6caac6bfe42fc9592a6299d2f7986d4cfc50f65313a71393a66696e645f6e6f6465313a74343a666e0000313a76343a34423f77313a79313a7165";
+        let vecs = hex::decode(hex_str).unwrap();
+        let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
+        println!("{:?}", decoded);
     }
 
     #[test]
