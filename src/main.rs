@@ -42,154 +42,154 @@ async fn main() -> io::Result<()> {
         let mut buf = [0; 1024];
         loop {
             trace!("Routing Table: {:?}", inner_routing_table);
-            
-            let (len, addr) = r.recv_from(&mut buf).await.unwrap();
-            
-            let _  = match proto::KRPCMessage::from_bencode(&buf[..len]) {
-                Ok(msg) => {
+                
+            if let Ok((len, addr)) = r.recv_from(&mut buf).await {
+                let _  = match proto::KRPCMessage::from_bencode(&buf[..len]) {
+                    Ok(msg) => {
 
-                    trace!("Received: {:?} from {:?}", msg, addr);
+                        trace!("Received: {:?} from {:?}", msg, addr);
 
-                    match msg.message_type.as_str() {
-                        "q" => {
-                            match msg.query.unwrap().as_str() {
-                                "ping" => {
-                                    //Add node to routing table
-                                    if let KRPCPayload::KRPCQueryPingRequest{ id } = msg.payload {
-                                        inner_routing_table.lock().await.ping_update(&id.clone());
-
-                                        //Response
-                                        let ping_response = proto::KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
-                                        
-                                        trace!("sending ping response: {:?}", ping_response);
-                                        
-                                        inner_s.send_to(&ping_response.to_bencode().unwrap(), addr).await.unwrap();
-                                    }
-                                }
-                                "get_peers" => {
-                                    if let KRPCPayload::KRPCQueryGetPeersRequest{ id, info_hash } = msg.payload {
-
+                        match msg.message_type.as_str() {
+                            "q" => {
+                                match msg.query.unwrap().as_str() {
+                                    "ping" => {
                                         //Add node to routing table
-                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                        
-                                        let nodes = inner_routing_table.lock().await.get_node_list_for_info_hash(&info_hash);
-                                        
-                                        let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
+                                        if let KRPCPayload::KRPCQueryPingRequest{ id } = msg.payload {
+                                            inner_routing_table.lock().await.ping_update(&id.clone());
 
-                                        inner_routing_table.lock().await.add_sent_token(&id, token.clone());
-
-                                        //Response
-                                        let get_peers_response = KRPCMessage::get_peers_response(inner_node_id.clone(), token, nodes, msg.transaction_id, None);
-
-                                        trace!("sending get_peers response: {:?}", get_peers_response);
-
-                                        inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
+                                            //Response
+                                            let ping_response = proto::KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
+                                            
+                                            trace!("sending ping response: {:?}", ping_response);
+                                            
+                                            inner_s.send_to(&ping_response.to_bencode().unwrap(), addr).await.unwrap();
+                                        }
                                     }
-                                }
-                                "announce_peer" => {
-                                    if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port, token, implied_port, seed: _ } = msg.payload {
-                                        //Add node to routing table
-                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                        
-                                        //Add info hash for this node
-                                        inner_routing_table.lock().await.add_info_hash(info_hash.clone(), id.clone());
+                                    "get_peers" => {
+                                        if let KRPCPayload::KRPCQueryGetPeersRequest{ id, info_hash } = msg.payload {
 
-                                        let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
+                                            //Add node to routing table
+                                            inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                            
+                                            let nodes = inner_routing_table.lock().await.get_node_list_for_info_hash(&info_hash);
+                                            
+                                            let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
 
-                                        inner_routing_table.lock().await.add_sent_token(&id, token.clone());
+                                            inner_routing_table.lock().await.add_sent_token(&id, token.clone());
 
-                                        //TODO check token
+                                            //Response
+                                            let get_peers_response = KRPCMessage::get_peers_response(inner_node_id.clone(), token, nodes, msg.transaction_id, None);
 
-                                        //Response
-                                        let get_peers_response = KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
+                                            trace!("sending get_peers response: {:?}", get_peers_response);
 
-                                        debug!("sending annouce_peers response: {:?}", get_peers_response);
-
-                                        //TODO implied_port
-                                        inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
+                                            inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
+                                        }
                                     }
-                                }
-                                "find_node" => {
-                                    if let KRPCPayload::KRPCQueryFindNodeRequest{ id, target } = msg.payload {
-                                        //Add node to routing table
-                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                        
-                                        //Find nodes
-                                        let nodes = inner_routing_table.lock().await.get_node_list_for_node_id(&id);
-                                        
-                                        //Response
-                                        let find_node_response = KRPCMessage::find_node_response(inner_node_id.clone(), nodes, msg.transaction_id);
+                                    "announce_peer" => {
+                                        if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port, token, implied_port, seed: _ } = msg.payload {
+                                            //Add node to routing table
+                                            inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                            
+                                            //Add info hash for this node
+                                            inner_routing_table.lock().await.add_info_hash(info_hash.clone(), id.clone());
 
-                                        trace!("sending find_node response: {:?}", find_node_response);
+                                            let token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
 
-                                        inner_s.send_to(&find_node_response.to_bencode().unwrap(), addr).await.unwrap();
+                                            inner_routing_table.lock().await.add_sent_token(&id, token.clone());
+
+                                            //TODO check token
+
+                                            //Response
+                                            let get_peers_response = KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
+
+                                            debug!("sending annouce_peers response: {:?}", get_peers_response);
+
+                                            //TODO implied_port
+                                            inner_s.send_to(&get_peers_response.to_bencode().unwrap(), addr).await.unwrap();
+                                        }
                                     }
-                                }
-                                q => {
-                                    warn!("Unknown query type: {:?}", q);
+                                    "find_node" => {
+                                        if let KRPCPayload::KRPCQueryFindNodeRequest{ id, target } = msg.payload {
+                                            //Add node to routing table
+                                            inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                            
+                                            //Find nodes
+                                            let nodes = inner_routing_table.lock().await.get_node_list_for_node_id(&id);
+                                            
+                                            //Response
+                                            let find_node_response = KRPCMessage::find_node_response(inner_node_id.clone(), nodes, msg.transaction_id);
+
+                                            trace!("sending find_node response: {:?}", find_node_response);
+
+                                            inner_s.send_to(&find_node_response.to_bencode().unwrap(), addr).await.unwrap();
+                                        }
+                                    }
+                                    q => {
+                                        warn!("Unknown query type: {:?}", q);
+                                    }
                                 }
                             }
-                        }
-                        "r" => {
-                            match msg.payload {
-                                //TODO check the transaction id
-                                KRPCPayload::KRPCQueryIdResponse { id, port: _, ip: _ } => {
-                                    //Add node to routing table
-                                    inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                }
-                                KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values: values } => {
-                                    //Add node to routing table
-                                    inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-                                    inner_routing_table.lock().await.add_token(id.clone(), token.clone());
+                            "r" => {
+                                match msg.payload {
+                                    //TODO check the transaction id
+                                    KRPCPayload::KRPCQueryIdResponse { id, port: _, ip: _ } => {
+                                        //Add node to routing table
+                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                    }
+                                    KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values: values } => {
+                                        //Add node to routing table
+                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+                                        inner_routing_table.lock().await.add_token(id.clone(), token.clone());
 
-                                    //Add nodes to routing table
-                                    trace!("get_peers response from {:?}. Nodes: {:?}", id, nodes);
-                                    if nodes.is_some() {
-                                        for node in nodes.unwrap().0 {
+                                        //Add nodes to routing table
+                                        trace!("get_peers response from {:?}. Nodes: {:?}", id, nodes);
+                                        if nodes.is_some() {
+                                            for node in nodes.unwrap().0 {
+                                                inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
+                                            }
+                                        }
+
+                                        if values.is_some() {
+                                        //TODO
+                                        //There's no node_id, so we need to ping these addresses to get them
+                                        }
+                                    }
+                                    KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
+                                        //Add node to routing table
+                                        inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
+
+                                        //Add nodes to routing table
+                                        trace!("find_node response from {:?}. Nodes: {:?}", id, nodes);
+                                        for node in nodes.0 {
                                             inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
                                         }
                                     }
-
-                                    if values.is_some() {
-                                       //TODO
-                                       //There's no node_id, so we need to ping these addresses to get them
+                                    _ => {
+                                        warn!("Unimplemented response type: {:?}", msg.payload);
                                     }
                                 }
-                                KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
-                                    //Add node to routing table
-                                    inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
-
-                                    //Add nodes to routing table
-                                    trace!("find_node response from {:?}. Nodes: {:?}", id, nodes);
-                                    for node in nodes.0 {
-                                        inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
+                            }
+                            "e" => {
+                                match msg.payload {
+                                    KRPCPayload::KRPCError(error) => {
+                                        warn!("Error: {:?}", error);
+                                    }
+                                    _ => {
+                                        warn!("Unimplemented error type: {:?}", msg.payload);
                                     }
                                 }
-                                _ => {
-                                    warn!("Unimplemented response type: {:?}", msg.payload);
-                                }
+                            }
+                            _ => {
+                                warn!("Unknown message type: {:?}", msg.message_type);
                             }
                         }
-                        "e" => {
-                            match msg.payload {
-                                KRPCPayload::KRPCError(error) => {
-                                    warn!("Error: {:?}", error);
-                                }
-                                _ => {
-                                    warn!("Unimplemented error type: {:?}", msg.payload);
-                                }
-                            }
-                        }
-                        _ => {
-                            warn!("Unknown message type: {:?}", msg.message_type);
-                        }
+                    },
+                    Err(e) => {
+                        error!("Error decoding message: {:?}", e);
+                        continue;
                     }
-                },
-                Err(e) => {
-                    error!("Error decoding message: {:?}", e);
-                    continue;
-                }
-            };
+                };
+            }
         }
     });
 
