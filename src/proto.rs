@@ -197,7 +197,11 @@ impl FromBencode for CompactNodeList {
             nodes.push(CompactNode { id, addr });
 
             if bytes.is_empty() || bytes.len() < 26 {
-                warn!("CompactNodeList too short");
+
+                if bytes.len() > 0 {
+                    warn!("CompactNodeList too short");
+                }
+                
                 break;
             }
         }
