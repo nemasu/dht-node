@@ -1,6 +1,5 @@
 use bendy::encoding::{Error, SingleItemEncoder, ToBencode};
 use bendy::decoding::FromBencode;
-use bendy::value;
 use std::net::SocketAddrV4;
 use byteorder::{
     NetworkEndian,
@@ -9,10 +8,10 @@ use byteorder::{
 use rand::Rng;
 use core::fmt;
 
-use log::{info, warn, error};
+use log::warn;
 
 #[derive(PartialEq, Clone, Eq, Hash)]
-pub struct ByteArray(Vec<u8>);
+pub struct ByteArray(pub Vec<u8>);
 
 impl ByteArray {
     pub fn new(bytes: Vec<u8>) -> Self {
@@ -34,7 +33,42 @@ impl ByteArray {
     pub fn new_from_i32(num: i32) -> Self {
         ByteArray(num.to_be_bytes().to_vec())
     }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(&self.0)
+    }
+
+    pub fn from_hex(hex_str: &str) -> Self {
+        ByteArray(hex::decode(hex_str).unwrap())
+    }
 }
+impl PartialOrd for ByteArray {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        //First check the number of bytes, larger is greater
+        if self.0.len() > other.0.len() {
+            return Some(std::cmp::Ordering::Greater);
+        } else if self.0.len() < other.0.len() {
+            return Some(std::cmp::Ordering::Less);
+        }
+        
+        //Ordering is done by comparing the bytes in the array, this is in big-endian order.
+        for (a, b) in self.0.iter().zip(other.0.iter()) {
+            if a > b {
+                return Some(std::cmp::Ordering::Greater);
+            } else if a < b {
+                return Some(std::cmp::Ordering::Less);
+            }
+        }
+
+        Some(std::cmp::Ordering::Equal)
+    }
+}
+impl Ord for ByteArray {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
 impl ToBencode for ByteArray {
     const MAX_DEPTH: usize = 0;
 
@@ -141,16 +175,8 @@ impl fmt::Debug for CompactAddress {
 #[derive(Debug, PartialEq)]
 pub struct CompactNodeList(pub Vec<CompactNode>);
 impl CompactNodeList {
-    pub fn new() -> Self {
-        CompactNodeList(Vec::new())
-    }
-    
     pub fn new_from_vec(nodes: Vec<CompactNode>) -> Self {
         CompactNodeList(nodes)
-    }
-
-    pub fn push(mut self, node: CompactNode) {
-        self.0.push(node);
     }
 }
 impl ToBencode for CompactNodeList {
@@ -261,7 +287,7 @@ impl FromBencode for CompactNode {
 }
 
 #[derive(PartialEq)]
-pub struct KRPCError(u8, String);
+pub struct KRPCError(pub u8, pub String);
 impl ToBencode for KRPCError {
     const MAX_DEPTH: usize = 1;
 
@@ -311,6 +337,18 @@ pub struct KRPCMessage {
 }
 
 impl KRPCMessage {
+
+    pub fn error(error_code: u8, message: String, transaction_id: TransactionId) -> Self {
+        KRPCMessage {
+            payload: KRPCPayload::KRPCError(KRPCError(error_code, message)),
+            transaction_id: transaction_id,
+            message_type: "e".to_string(),
+            query: None,
+            ip: None,
+            version: None,
+        }
+    }
+
     pub fn find_node(node_id: NodeId, target: NodeId, transaction_id: TransactionId) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryFindNodeRequest {
@@ -339,6 +377,7 @@ impl KRPCMessage {
         }
     }
 
+    #[allow(dead_code)]
     pub fn announce_peer(node_id: NodeId, info_hash: InfoHash, token: Token, port: u32, transaction_id: TransactionId) -> Self{
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryAnnouncePeerRequest {
@@ -357,6 +396,7 @@ impl KRPCMessage {
         }
     }
 
+    #[allow(dead_code)]
     pub fn announce_peer_response(node_id: NodeId, transaction_id: TransactionId) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryIdResponse {
@@ -892,5 +932,23 @@ mod tests {
         println!("{:?}", decoded);
 
         assert_eq!(node_id, decoded);
+    }
+
+    #[test]
+    fn test_bytearray_ordering() {
+        let a = ByteArray::new(vec![0x57, 0x9c, 0xbf, 0xd0, 0xcd, 0x1b, 0x56, 0x5d]);
+        let b = ByteArray::new(vec![0x7C, 0xD5, 0x63, 0x21, 0xED, 0x45, 0x87, 0xCD]);
+        let c = ByteArray::new(vec![0x7C, 0xD5, 0x63, 0x21, 0xED, 0x45, 0x87, 0xCA]);
+
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(a.clone());
+        set.insert(b.clone());
+        set.insert(c.clone());
+
+        //Check that they are in the correct order: a, c, b
+        let mut iter = set.iter();
+        assert_eq!(iter.next().unwrap(), &a);
+        assert_eq!(iter.next().unwrap(), &c);
+        assert_eq!(iter.next().unwrap(), &b);
     }
 }

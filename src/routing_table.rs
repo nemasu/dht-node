@@ -1,12 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
+use json;
 
-use crate::proto::{self, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token};
+use crate::proto::{self, ByteArray, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token, TransactionId};
 
-use log::{debug, error, info, warn, trace};
+use log::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
+
+    //This clients node_id
+    pub node_id: NodeId,
+
     //Map of node to peer info (ip, address)
     pub nodes: HashMap<NodeId, CompactAddress>,
     
@@ -21,12 +27,14 @@ pub struct RoutingTable {
 
     //Node -> (last heard from, last pinged)
     pub nodes_time: HashMap<NodeId, (u64,u64)>,
+
+    //TODO Keep track of stale/old nodes and query them from time to time
 }
 
 impl RoutingTable {
 
     pub fn debug_stats(&self) {
-        debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?} pinged_nodes size {:?}",
+        debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}",
             self.nodes.len(),
             self.info_hashes.len(),
             self.sent_tokens.len(),
@@ -35,9 +43,44 @@ impl RoutingTable {
         );
     }
 
+    pub fn xor_bytearray(a: &ByteArray, b: &ByteArray) -> ByteArray {
+        let mut result = Vec::with_capacity(a.0.len());
+        for i in 0..a.0.len() {
+            result.push(a.0[i] ^ b.0[i]);
+        }
+        ByteArray::new(result)
+    }
+
     //Save the routing table to a file
     pub fn save(&self, path: &str) {
-       //TODO
+        //NodeId
+        let mut data = json::object!{
+            node_id: self.node_id.to_hex(),
+            nodes: {},
+            info_hashes: {},
+        };
+
+        //Nodes
+        for (node_id, addr) in &self.nodes {
+            let addr_hex = hex::encode(addr.to_bytes());
+            
+            data["nodes"][node_id.to_hex()] = json::object!{
+                "addr": addr_hex,
+            };
+        }
+
+        //info_hashes
+        for (info_hash, node_set) in &self.info_hashes {
+            let mut node_set_hex = Vec::new();
+            for node_id in node_set {
+                node_set_hex.push(node_id.to_hex());
+            }
+            data["info_hashes"][info_hash.to_hex()] = json::array!(node_set_hex);
+        }
+
+        //node_times, tokens and sent_tokens are not saved
+
+        std::fs::write(path, data.dump()).unwrap();
     }
 
     //Load the routing table from a file
@@ -45,16 +88,52 @@ impl RoutingTable {
 
         //Check if the file exists located at path
         if Path::new(path).exists() {
-            RoutingTable::new()
-        } else {
-            //let data: Vec<u8> = std::fs::read(path).unwrap();
+            //Load the file
+            let data = json::parse(std::fs::read_to_string(path).unwrap().as_str()).unwrap();
 
+            //NodeId
+            let node_id = NodeId::from_hex(data["node_id"].as_str().unwrap());
+            let mut routing_table = RoutingTable {
+                node_id: node_id,
+                nodes: HashMap::new(),
+                info_hashes: HashMap::new(),
+                tokens: HashMap::new(),
+                sent_tokens: HashMap::new(),
+                nodes_time: HashMap::new(),
+            };
+
+            //Nodes
+            for (node_id_hex, node_data) in data["nodes"].entries() {
+                let node_id = NodeId::from_hex(node_id_hex);
+                let addr = CompactAddress::new(hex::decode(node_data["addr"].as_str().unwrap()).unwrap());
+                routing_table.nodes.insert(node_id, addr);
+            }
+
+            //info_hashes
+            for (info_hash_hex, node_set) in data["info_hashes"].entries() {
+                let info_hash = InfoHash::from_hex(info_hash_hex);
+                let mut node_set_data = HashSet::new();
+                for node_ids in node_set.members() {
+                    for node_id_hex in node_ids.members() {
+                        let node_id = NodeId::from_hex(node_id_hex.as_str().unwrap());
+                        node_set_data.insert(node_id);
+                    }
+                }
+                routing_table.info_hashes.insert(info_hash, node_set_data);
+            }
+
+            debug!("Loaded routing table.");
+
+            routing_table
+
+        } else {
             RoutingTable::new()
         }
     }
 
     pub fn new() -> Self {
         RoutingTable {
+            node_id: NodeId::generate_nodeid(),
             nodes: HashMap::new(),
             info_hashes: HashMap::new(),
             tokens: HashMap::new(),
@@ -74,7 +153,7 @@ impl RoutingTable {
         }
     }
 
-    pub fn node_get_for_ping(&self) -> Vec<CompactNode> {
+    pub fn node_get_for_ping(&mut self) -> Vec<CompactNode> {
         let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let mut nodes_to_ping = Vec::new();
         for (node_id, addr) in &self.nodes {
@@ -83,6 +162,9 @@ impl RoutingTable {
                 if (current_time as i64 - time.0 as i64) > (60*11) && (current_time as i64 - time.1 as i64) > 60 {
                     nodes_to_ping.push(CompactNode::new(node_id.clone(), addr.clone()));
                 }
+            } else {
+                nodes_to_ping.push(CompactNode::new(node_id.clone(), addr.clone()));
+                self.nodes_time.insert(node_id.clone(), (current_time, current_time));
             }
         }
         nodes_to_ping
@@ -109,61 +191,88 @@ impl RoutingTable {
 
         //Remove nodes from all maps/sets that have not responded to ping
         for node_id in nodes_to_remove {
-            self.nodes.remove(&node_id);
-            
-            //Remove the hashset entry from info_hashes
-            for (info_hash, node_set) in &mut self.info_hashes.clone() {
-                for node in node_set.clone() {
-                    if node == node_id {
-                        self.info_hashes.get_mut(info_hash).unwrap().remove(&node_id);
-                    }
+            self.remove_node(&node_id);
+        }
+    }
+
+    pub fn remove_node(&mut self, node_id: &NodeId) {
+        trace!("Removing node: {:?}", node_id);
+
+        self.nodes.remove(node_id);
+
+        //Remove the hashset entry from info_hashes
+        for (info_hash, node_set) in &mut self.info_hashes.clone() {
+            for node in node_set.clone() {
+                if node == *node_id {
+                    self.info_hashes.get_mut(info_hash).unwrap().remove(node_id);
                 }
             }
+        }
 
-            self.tokens.remove(&node_id);
+        self.tokens.remove(node_id);
 
-            self.sent_tokens.remove(&node_id);
+        self.sent_tokens.remove(node_id);
 
-            self.nodes_time.remove(&node_id);
+        self.nodes_time.remove(node_id);
+    }
+
+    pub fn remove_node_by_addr(&mut self, addr: &CompactAddress) {
+        let mut node_id = None;
+        for (node_id_from_map, addr_from_map) in &self.nodes {
+            if addr == addr_from_map {
+                node_id = Some(node_id_from_map.clone());
+                break;
+            }
+        }
+
+        if let Some(node_id) = node_id {
+            self.remove_node(&node_id);
         }
     }
 
     //used for get_peers response
-    pub fn get_node_list_for_info_hash(&self, info_hash: &InfoHash) -> CompactNodeList {
-        let mut node_list = Vec::new();
+    pub fn get_node_list_for_info_hash(&self, info_hash: &InfoHash) -> (CompactNodeList, Option<Vec<CompactAddress>>){
+        let mut value_list = Vec::new();
 
         if let Some(node_set) = self.get_info_hash(info_hash) {
             for node_id in node_set {
                 if let Some(addr) = self.get_node(node_id) {
-                    node_list.push(CompactNode::new(node_id.clone(), addr.clone()));
+                    value_list.push(addr.clone());
                 }
             }
         }
 
-        //TODO calculate closest nodes to respond with if we don't have the info_hash
-        //Random for now
-        while node_list.len() < 8 {
-            let random_node = self.get_random_nodes(1);
-            node_list.push(random_node[0].clone());
+        let mut node_list = BTreeMap::new();
+        //Calculate closest nodes to respond with if we don't have the info_hash
+        for (node_id, addr) in &self.nodes {
+            //XOR distance between node_id and info_hash
+            let xor_result = RoutingTable::xor_bytearray(node_id, &info_hash);
+            node_list.insert(xor_result, CompactNode::new(node_id.clone(), addr.clone()));
         }
+
+        // Create a CompactNodeList of the lowest 8 elements from the BTreeMap
+        let lowest_nodes = node_list.iter().take(8).map(|(_, node)| node.clone()).collect::<Vec<CompactNode>>();
+        let compact_node_list = CompactNodeList::new_from_vec(lowest_nodes);
                 
-        CompactNodeList::new_from_vec(node_list)
+        (compact_node_list, Some(value_list))
     }
 
     //used for find_node response
     pub fn get_node_list_for_node_id(&self, node_id: &NodeId) -> CompactNodeList {
-        let mut node_list = Vec::new();
-
-        //TODO calculate closest nodes to respond with
-        //Random for now
-        while node_list.len() < 8 {
-            let random_node = self.get_random_nodes(1);
-            node_list.push(random_node[0].clone());
+        //Calculate closest nodes to respond with
+        let mut node_list = BTreeMap::new();
+        for (node_id_from_map, addr) in &self.nodes {
+            //XOR distance between node_id_from_map and node_id
+            let xor_result = RoutingTable::xor_bytearray(&node_id_from_map, &node_id);
+            node_list.insert(xor_result, CompactNode::new(node_id_from_map.clone(), addr.clone()));
         }
-                
-        CompactNodeList::new_from_vec(node_list)
+
+        // Create a CompactNodeList of the lowest 8 elements from the BTreeMap
+        let lowest_nodes = node_list.iter().take(8).map(|(_, node)| node.clone()).collect::<Vec<CompactNode>>();
+        let compact_node_list = CompactNodeList::new_from_vec(lowest_nodes);
+
+        compact_node_list
     }
-    
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
         self.node_time_update(&node_id);
@@ -172,20 +281,6 @@ impl RoutingTable {
 
     pub fn get_node(&self, node_id: &NodeId) -> Option<&CompactAddress> {
         self.nodes.get(node_id)
-    }
-
-    pub fn remove_node(&mut self, node_id: &NodeId) {
-        self.nodes.remove(node_id);
-    }
-
-    pub fn get_all_nodes(&self) -> Vec<CompactNode> {
-        let mut node_list = Vec::new();
-
-        for (node_id, addr) in &self.nodes {
-            node_list.push(CompactNode::new(node_id.clone(), addr.clone()));
-        }
-
-        node_list
     }
 
     pub fn get_random_nodes(&self, amount: usize) -> Vec<CompactNode> {
@@ -212,6 +307,23 @@ impl RoutingTable {
         node_list
     }
 
+    pub fn get_closest_nodes(&self, node_id: &NodeId, amount: usize) -> Vec<CompactNode> {
+        let mut node_list = Vec::new();
+        let mut node_map = BTreeMap::new();
+
+        for (node_id_from_map, addr) in &self.nodes {
+            //XOR distance between node_id_from_map and node_id
+            let xor_result = RoutingTable::xor_bytearray(node_id_from_map, node_id);
+            node_map.insert(xor_result, CompactNode::new(node_id_from_map.clone(), addr.clone()));
+        }
+
+        // Create a CompactNodeList of the lowest 8 elements from the BTreeMap
+        let lowest_nodes = node_map.iter().take(amount).map(|(_, node)| node.clone()).collect::<Vec<CompactNode>>();
+        node_list.extend(lowest_nodes);
+
+        node_list
+    }
+
     pub fn add_info_hash(&mut self, info_hash: InfoHash, node_id: NodeId) {
         self.node_time_update(&node_id);
         let node_set = self.info_hashes.entry(info_hash).or_insert(HashSet::new());
@@ -222,10 +334,14 @@ impl RoutingTable {
         self.info_hashes.get(info_hash)
     }
 
-    pub fn remove_info_hash(&mut self, info_hash: &InfoHash, node_id: &NodeId) {
-        if let Some(node_set) = self.info_hashes.get_mut(info_hash) {
-            node_set.remove(node_id);
+    pub fn get_all_info_hashes(&self) -> Vec<InfoHash> {
+        let mut info_hash_list = Vec::new();
+
+        for info_hash in self.info_hashes.keys() {
+            info_hash_list.push(info_hash.clone());
         }
+
+        info_hash_list
     }
 
     pub fn add_token(&mut self, node_id: NodeId, token: Token) {
@@ -241,24 +357,50 @@ impl RoutingTable {
         self.tokens.get(node_id)
     }
 
-    pub fn remove_token(&mut self, node_id: &NodeId) {
-        self.tokens.remove(node_id);
-    }
-
     pub fn add_sent_token(&mut self, node_id: &NodeId, token: Token) {
         self.node_time_update(&node_id);
         let token_set = self.sent_tokens.entry(node_id.clone()).or_insert(HashSet::new());
         token_set.insert(token);
     }
 
+    //TODO
     pub fn get_sent_token(&self, node_id: &NodeId) -> Option<&HashSet<Token>> {
         self.sent_tokens.get(node_id)
     }
+}
 
-    pub fn remove_sent_token(&mut self, node_id: &NodeId, token: &Token) {
-        if let Some(token_set) = self.sent_tokens.get_mut(node_id) {
-            token_set.remove(token);
+pub struct TransactionCounter {
+    pub transaction_id: i32,
+
+    pub id_addr_map: HashMap<i32, CompactAddress>,
+}
+impl TransactionCounter {
+    pub fn new() -> Self {
+        TransactionCounter {
+            transaction_id: 0,
+            id_addr_map: HashMap::new(),
         }
+    }
+
+    pub fn get_addr_for_tranaction_id(&self, id: TransactionId) -> Option<&CompactAddress> {
+        if id.0.len() != 4 {
+            panic!("TransactionId is not 4 bytes long");
+        }
+
+        //Convert id to i32 and get the address from the map
+        let int_id = i32::from_be_bytes([id.0[0], id.0[1], id.0[2], id.0[3]]);
+
+         // Get the address from the map
+        self.id_addr_map.get(&int_id)
+    }
+
+    pub fn get_transaction_id(&mut self, addr: CompactAddress) -> ByteArray {
+        self.transaction_id += 1;
+
+        //Add the transaction id to the map
+        self.id_addr_map.insert(self.transaction_id, addr);
+
+        ByteArray::new_from_i32(self.transaction_id)
     }
 }
 
@@ -267,6 +409,19 @@ mod tests {
     use std::net::SocketAddrV4;
 
     use super::*;
+
+    #[test]
+    fn test_xor() {
+        let a = ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        let b = ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        let result = RoutingTable::xor_bytearray(&a, &b);
+        assert_eq!(result, ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]));
+
+        let a = ByteArray::new(vec![0x57, 0x9c, 0xbf, 0xd0, 0xcd, 0x1b, 0x56, 0x5d]);
+        let b = ByteArray::new(vec![0x7C, 0xD5, 0x63, 0x21, 0xED, 0x45, 0x87, 0xCD]);
+        let result = RoutingTable::xor_bytearray(&a, &b);
+        assert_eq!(result, ByteArray::new(vec![0x2B, 0x49, 0xDC, 0xF1, 0x20, 0x5E, 0xD1, 0x90]));
+    }
 
     #[test]
     fn test_routing_table() {
@@ -283,6 +438,6 @@ mod tests {
         
         let node_list = routing_table.get_node_list_for_info_hash(&info_hash);
         println!("{:?}", node_list);
-        assert_eq!(node_id, node_list.0.get(0).unwrap().id);
+        assert_eq!(node_id, node_list.0.0.get(0).unwrap().id);
     }
 }

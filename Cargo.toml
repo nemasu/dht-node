@@ -12,3 +12,4 @@ bendy = "*"
 num-bigint = "*"
 log = "*"
 simplelog = { version = "*", features = ["paris"] }
+json = "*"
