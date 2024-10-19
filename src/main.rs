@@ -296,7 +296,7 @@ async fn main() -> io::Result<()> {
             
             if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
                 warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                routing_table.lock().await.remove_node(&node_id);
+                routing_table.lock().await.remove_node(&node.id);
             } else {
                 routing_table.lock().await.ping_update(&node.id);
                 trace!("Pinging {:?}", ping);
@@ -312,7 +312,7 @@ async fn main() -> io::Result<()> {
                 
                 if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
                     warn!("Error sending find_node: {:?} to {:?}, removing node.", e, node.addr);
-                    routing_table.lock().await.remove_node(&node_id);
+                    routing_table.lock().await.remove_node(&node.id);
                 } else {
                     trace!("get_peers {:?}", find_node);
                 }
@@ -327,7 +327,7 @@ async fn main() -> io::Result<()> {
                 
                 if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
                     warn!("Error sending find_node: {:?} to {:?}, removing node.", e, node.addr);
-                    routing_table.lock().await.remove_node(&node_id);
+                    routing_table.lock().await.remove_node(&node.id);
                 } else {
                     trace!("get_peers {:?}", find_node);
                 }
@@ -345,7 +345,7 @@ async fn main() -> io::Result<()> {
                     
                     if let Err(e) = s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await {
                         warn!("Error sending get_peers: {:?} to {:?}, removing node.", e, node.addr);
-                        routing_table.lock().await.remove_node(&node_id);
+                        routing_table.lock().await.remove_node(&node.id);
                     } else {
                         trace!("get_peers {:?}", get_peers);
                     }
