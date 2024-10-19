@@ -185,7 +185,7 @@ async fn main() -> io::Result<()> {
 
                                         if values.is_some() {
                                             //TODO
-                                            //There's no node_id, so we need to ping these addresses to get them
+                                            //Ping the nodes in values, and add the node to info_hash
                                         }
                                     }
                                     KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
@@ -229,8 +229,13 @@ async fn main() -> io::Result<()> {
                         }
                     },
                     Err(e) => {
-                        error!("Error decoding message: {:?}", e);
-                        continue;
+                        warn!("Error decoding message: {:?}, message.", e);
+                        let error = KRPCMessage::error(203, "Protocol Error".to_string(), proto::TransactionId::new_from_i32(0));
+                        if let Err(e) = inner_s.send_to(&error.to_bencode().unwrap(), addr).await {
+                            warn!("Error sending error '{:?}' to: {:?}. Removing node.", e, addr);
+                            let a = CompactAddress::new_from_sockaddr(addr);
+                            inner_routing_table.lock().await.remove_node_by_addr(&a);
+                        }
                     }
                 };
             }
@@ -290,7 +295,7 @@ async fn main() -> io::Result<()> {
             let ping = proto::KRPCMessage::ping(node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
             
             if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
-                warn!("Error sending ping: {:?} to {:?}, removing node.", e, node.addr);
+                warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
                 routing_table.lock().await.remove_node(&node_id);
             } else {
                 routing_table.lock().await.ping_update(&node.id);
@@ -347,5 +352,7 @@ async fn main() -> io::Result<()> {
                 }
             }
         }
+
+        //TODO We want to make sure that the nodes we have stored for info_hashes still has the torrent.
     }
 }
