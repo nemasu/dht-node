@@ -313,7 +313,7 @@ async fn main() -> io::Result<()> {
     let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let mut last_nodes_count = routing_table.lock().await.nodes.len();
     loop {
-        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 3);
+        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 5);
         for node in nodes {
             let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
             
@@ -365,9 +365,11 @@ async fn main() -> io::Result<()> {
                     trace!("Pinging {:?}", ping);
                 }
             }
+            
+            //Refreshing bucket uses a random ID in the range (currently this is a random node we have in the bucket), and sends a find_node to the closest nodes to that ID.
             let nodes = routing_table.lock().await.node_get_for_refresh();
             for node in nodes {
-                let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
+                let find_node = proto::KRPCMessage::find_node(node_id.clone(), node.id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
                 
                 if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
                     warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
