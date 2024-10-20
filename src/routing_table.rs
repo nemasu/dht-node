@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read;
 use std::path::Path;
 use json;
 
 use crate::proto::{self, ByteArray, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token, TransactionId};
+
+use crate::bucket::Buckets;
 
 use log::{debug, trace};
 
@@ -12,6 +13,9 @@ pub struct RoutingTable {
 
     //This clients node_id
     pub node_id: NodeId,
+
+    //Buckets
+    pub buckets: Buckets,
 
     //Map of node to peer info (ip, address)
     pub nodes: HashMap<NodeId, CompactAddress>,
@@ -23,36 +27,48 @@ pub struct RoutingTable {
     pub tokens: HashMap<NodeId, Token>,
 
     //Map of node to generated tokens sent 
-    pub sent_tokens: HashMap<NodeId, HashSet<Token>>,
+    pub sent_tokens: HashMap<NodeId, Token>,
 
-    //Node -> (last heard from, last pinged)
+    //Node -> (last heard from, last refresh time)
     pub nodes_time: HashMap<NodeId, (u64,u64)>,
 
-    //TODO Keep track of stale/old nodes and query them from time to time
+    //TODO Keep track of stale/old nodes as backup?
 }
 
 impl RoutingTable {
 
+    pub fn new(node_id: &NodeId) -> Self {
+        RoutingTable {
+            node_id: node_id.clone(),
+            nodes: HashMap::new(),
+            info_hashes: HashMap::new(),
+            tokens: HashMap::new(),
+            sent_tokens: HashMap::new(),
+            nodes_time: HashMap::new(),
+            buckets: Buckets::new(&node_id),
+        }
+    }
+
     pub fn debug_stats(&self) {
-        debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}",
+        debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}, bucket size {:?}",
             self.nodes.len(),
             self.info_hashes.len(),
             self.sent_tokens.len(),
             self.tokens.len(),
-            self.nodes_time.len()
+            self.nodes_time.len(),
+            self.buckets.buckets.len(),
         );
     }
 
-    pub fn xor_bytearray(a: &ByteArray, b: &ByteArray) -> ByteArray {
-        let mut result = Vec::with_capacity(a.0.len());
-        for i in 0..a.0.len() {
-            result.push(a.0[i] ^ b.0[i]);
-        }
-        ByteArray::new(result)
+    pub fn get_node_id(&self) -> NodeId {
+        self.node_id.clone()
     }
 
     //Save the routing table to a file
-    pub fn save(&self, path: &str) {
+    pub fn save(&self) {
+
+        let path = self.node_id.to_hex() + ".json";
+
         //NodeId
         let mut data = json::object!{
             node_id: self.node_id.to_hex(),
@@ -84,22 +100,37 @@ impl RoutingTable {
     }
 
     //Load the routing table from a file
-    pub fn load_or_new(path: &str) -> Self {
+    pub fn load_or_new(cmdline_node_id: Option<NodeId>) -> Self {
+
+        let mut node_id: Option<NodeId> = None;
+
+        let path = match cmdline_node_id {
+            Some(id) => {
+                node_id = Some(id.clone());
+                id.to_hex() + ".json"
+            },
+            None => {
+                node_id = Some(NodeId::generate_nodeid());
+                node_id.clone().unwrap().clone().to_hex() + ".json"
+            },
+        };
+        
 
         //Check if the file exists located at path
-        if Path::new(path).exists() {
+        if Path::new(&path).exists() {
             //Load the file
             let data = json::parse(std::fs::read_to_string(path).unwrap().as_str()).unwrap();
 
             //NodeId
             let node_id = NodeId::from_hex(data["node_id"].as_str().unwrap());
             let mut routing_table = RoutingTable {
-                node_id: node_id,
+                node_id: node_id.clone(),
                 nodes: HashMap::new(),
                 info_hashes: HashMap::new(),
                 tokens: HashMap::new(),
                 sent_tokens: HashMap::new(),
                 nodes_time: HashMap::new(),
+                buckets: Buckets::new(&node_id),
             };
 
             //Nodes
@@ -122,23 +153,24 @@ impl RoutingTable {
                 routing_table.info_hashes.insert(info_hash, node_set_data);
             }
 
+            //Insert nodes into buckets
+            let mut nodes_to_remove = Vec::new();
+            for (node_id, _) in &routing_table.nodes {
+                if !routing_table.buckets.add(node_id.clone()) {
+                    nodes_to_remove.push(node_id.clone());
+                }
+            }
+            for node_id in nodes_to_remove {
+                routing_table.remove_node(&node_id);
+            }
+
             debug!("Loaded routing table.");
 
             routing_table
 
         } else {
-            RoutingTable::new()
-        }
-    }
-
-    pub fn new() -> Self {
-        RoutingTable {
-            node_id: NodeId::generate_nodeid(),
-            nodes: HashMap::new(),
-            info_hashes: HashMap::new(),
-            tokens: HashMap::new(),
-            sent_tokens: HashMap::new(),
-            nodes_time: HashMap::new(),
+            debug!("Rotuing table not found, creating new using node_id: {:?}.", &node_id.clone().unwrap());
+            RoutingTable::new(&node_id.unwrap())
         }
     }
 
@@ -168,6 +200,22 @@ impl RoutingTable {
             }
         }
         nodes_to_ping
+    }
+
+    pub fn node_get_for_refresh(&mut self) ->Vec<CompactNode> {
+        let mut to_refresh = Vec::new();
+
+        for bucket in self.buckets.buckets.iter() {
+            if bucket.last_changed + 60*15 < std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
+                let random_index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..bucket.nodes.len());
+                let node_id = bucket.nodes.get(random_index).unwrap();
+
+                let addr = self.nodes.get(node_id).unwrap();
+                to_refresh.push(CompactNode::new(node_id.clone(), addr.clone()));
+            }
+        }
+
+        to_refresh
     }
 
     pub fn ping_update(&mut self, node_id: &NodeId) {
@@ -214,6 +262,8 @@ impl RoutingTable {
         self.sent_tokens.remove(node_id);
 
         self.nodes_time.remove(node_id);
+
+        self.buckets.remove(node_id);   
     }
 
     pub fn remove_node_by_addr(&mut self, addr: &CompactAddress) {
@@ -246,7 +296,7 @@ impl RoutingTable {
         //Calculate closest nodes to respond with if we don't have the info_hash
         for (node_id, addr) in &self.nodes {
             //XOR distance between node_id and info_hash
-            let xor_result = RoutingTable::xor_bytearray(node_id, &info_hash);
+            let xor_result = ByteArray::xor_bytearray(node_id, &info_hash);
             node_list.insert(xor_result, CompactNode::new(node_id.clone(), addr.clone()));
         }
 
@@ -263,7 +313,7 @@ impl RoutingTable {
         let mut node_list = BTreeMap::new();
         for (node_id_from_map, addr) in &self.nodes {
             //XOR distance between node_id_from_map and node_id
-            let xor_result = RoutingTable::xor_bytearray(&node_id_from_map, &node_id);
+            let xor_result = ByteArray::xor_bytearray(&node_id_from_map, &node_id);
             node_list.insert(xor_result, CompactNode::new(node_id_from_map.clone(), addr.clone()));
         }
 
@@ -276,7 +326,8 @@ impl RoutingTable {
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
         self.node_time_update(&node_id);
-        self.nodes.insert(node_id, addr);
+        self.nodes.insert(node_id.clone(), addr);
+        self.buckets.add(node_id.clone());
     }
 
     pub fn get_node(&self, node_id: &NodeId) -> Option<&CompactAddress> {
@@ -313,7 +364,7 @@ impl RoutingTable {
 
         for (node_id_from_map, addr) in &self.nodes {
             //XOR distance between node_id_from_map and node_id
-            let xor_result = RoutingTable::xor_bytearray(node_id_from_map, node_id);
+            let xor_result = ByteArray::xor_bytearray(node_id_from_map, node_id);
             node_map.insert(xor_result, CompactNode::new(node_id_from_map.clone(), addr.clone()));
         }
 
@@ -359,13 +410,19 @@ impl RoutingTable {
 
     pub fn add_sent_token(&mut self, node_id: &NodeId, token: Token) {
         self.node_time_update(&node_id);
-        let token_set = self.sent_tokens.entry(node_id.clone()).or_insert(HashSet::new());
-        token_set.insert(token);
+        self.sent_tokens.insert(node_id.clone(), token);
     }
 
-    //TODO
-    pub fn get_sent_token(&self, node_id: &NodeId) -> Option<&HashSet<Token>> {
-        self.sent_tokens.get(node_id)
+    pub fn get_sent_token(&self, node_id: &NodeId) -> Option<Token> {
+        let token = self.sent_tokens.get(node_id).unwrap().clone();
+        Some(token)
+    }
+
+    pub fn update_port(&mut self, node_id: &NodeId, port: u16) {
+        let addr = self.nodes.get(node_id).unwrap().clone();
+        let sockaddr = addr.addr;
+        let new_sockaddr = std::net::SocketAddr::new((*sockaddr.ip()).into(), port);
+        self.nodes.insert(node_id.clone(), CompactAddress::new_from_sockaddr(new_sockaddr));
     }
 }
 
@@ -414,20 +471,21 @@ mod tests {
     fn test_xor() {
         let a = ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]);
         let b = ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]);
-        let result = RoutingTable::xor_bytearray(&a, &b);
+        let result = ByteArray::xor_bytearray(&a, &b);
         assert_eq!(result, ByteArray::new(vec![0, 0, 0, 0, 0, 0, 0, 0]));
 
         let a = ByteArray::new(vec![0x57, 0x9c, 0xbf, 0xd0, 0xcd, 0x1b, 0x56, 0x5d]);
         let b = ByteArray::new(vec![0x7C, 0xD5, 0x63, 0x21, 0xED, 0x45, 0x87, 0xCD]);
-        let result = RoutingTable::xor_bytearray(&a, &b);
+        let result = ByteArray::xor_bytearray(&a, &b);
         assert_eq!(result, ByteArray::new(vec![0x2B, 0x49, 0xDC, 0xF1, 0x20, 0x5E, 0xD1, 0x90]));
     }
 
     #[test]
     fn test_routing_table() {
-        let mut routing_table = RoutingTable::new();
-
         let node_id = NodeId::generate_nodeid();
+        let mut routing_table = RoutingTable::new(&node_id);
+        let node_id = routing_table.get_node_id();
+
         let addr: SocketAddrV4 = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080);
         let compact_addr = CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(addr));
 

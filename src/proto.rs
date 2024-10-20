@@ -39,7 +39,103 @@ impl ByteArray {
     }
 
     pub fn from_hex(hex_str: &str) -> Self {
+        //Remove spaces from hex_str
+        let hex_str = hex_str.replace(" ", "");
+
         ByteArray(hex::decode(hex_str).unwrap())
+    }
+
+    pub fn xor_bytearray(a: &ByteArray, b: &ByteArray) -> ByteArray {
+        let mut result = Vec::with_capacity(a.0.len());
+        for i in 0..a.0.len() {
+            result.push(a.0[i] ^ b.0[i]);
+        }
+        ByteArray::new(result)
+    }
+
+    pub fn divide_by_2(a: &ByteArray) -> (ByteArray, Option<u8>) {
+        let mut result = Vec::with_capacity(a.0.len());
+        let mut carry = 0;
+        let mut remainder = None;
+    
+        for &byte in &a.0 {
+            let new_byte = (byte >> 1) | (carry << 7);
+            carry = byte & 1;
+            result.push(new_byte);
+        }
+    
+        // If there is a carry left, it means there is a remainder
+        if carry != 0 {
+            remainder = Some(carry);
+        }
+    
+        (ByteArray::new(result), remainder)
+    }
+
+    pub fn add_one(a: &ByteArray) -> ByteArray {
+        let mut result = Vec::with_capacity(a.0.len());
+        let mut carry = 1;
+    
+        for &byte in a.0.iter().rev() {
+            let (new_byte, new_carry) = byte.overflowing_add(carry);
+            carry = if new_carry { 1 } else { 0 };
+            result.push(new_byte);
+        }
+    
+        if carry == 1 {
+            result.push(1);
+        }
+    
+        result.reverse();
+        ByteArray::new(result)
+    }
+
+    pub fn add(a: &ByteArray, b: &ByteArray) -> ByteArray {
+        let max_len = std::cmp::max(a.0.len(), b.0.len());
+        let mut result = Vec::with_capacity(max_len + 1);
+        let mut carry = 0;
+    
+        for i in 0..max_len {
+            let byte_a = a.0.get(a.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
+            let byte_b = b.0.get(b.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
+    
+            let (new_byte, carry1) = byte_a.overflowing_add(byte_b);
+            let (new_byte, carry2) = new_byte.overflowing_add(carry);
+            carry = (carry1 as u8) + (carry2 as u8);
+    
+            result.push(new_byte);
+        }
+    
+        if carry > 0 {
+            result.push(carry);
+        }
+    
+        result.reverse();
+        ByteArray::new(result)
+    }
+
+    pub fn subtract(a: &ByteArray, b: &ByteArray) -> ByteArray {
+        let max_len = std::cmp::max(a.0.len(), b.0.len());
+        let mut result = Vec::with_capacity(max_len);
+        let mut borrow = 0;
+    
+        for i in 0..max_len {
+            let byte_a = a.0.get(a.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
+            let byte_b = b.0.get(b.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
+    
+            let (new_byte, borrow1) = byte_a.overflowing_sub(byte_b + borrow);
+            borrow = if borrow1 { 1 } else { 0 };
+    
+            result.push(new_byte);
+        }
+    
+        // Remove leading zeros from the result
+        while result.len() > 1 && result.last() == Some(&0) {
+            result.pop();
+        }
+    
+        result.reverse();
+        ByteArray::new(result)
     }
 }
 impl PartialOrd for ByteArray {
@@ -950,5 +1046,30 @@ mod tests {
         assert_eq!(iter.next().unwrap(), &a);
         assert_eq!(iter.next().unwrap(), &c);
         assert_eq!(iter.next().unwrap(), &b);
+    }
+
+    #[test]
+    fn test_bytearray_divide() {
+        let a = ByteArray::new_from_i32(10000);
+        let (b, remainder) = ByteArray::divide_by_2(&a);
+        assert_eq!(b, ByteArray::new_from_i32(5000));
+        assert_eq!(remainder.unwrap_or(0), 0);
+
+
+        let a = ByteArray::from_hex("57 9c bf d0 cd 1b 56 ff ff");
+        let (b, remainder) = ByteArray::divide_by_2(&a);
+        assert_eq!(b, ByteArray::from_hex("2B CE 5F E8 66 8D AB 7F FF"));
+        assert_eq!(remainder.unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_bytearray_add_one() {
+        let a = ByteArray::new_from_i32(10000);
+        let b = ByteArray::add_one(&a);
+        assert_eq!(b, ByteArray::new_from_i32(10001));
+
+        let a = ByteArray::from_hex("57 9c bf d0 cd 1b 56 ff ff");
+        let b = ByteArray::add_one(&a);
+        assert_eq!(b, ByteArray::from_hex("57 9c bf d0 cd 1b 57 00 00"));
     }
 }
