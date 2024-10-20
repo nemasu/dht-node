@@ -223,7 +223,7 @@ impl RoutingTable {
             routing_table
 
         } else {
-            debug!("Rotuing table not found, creating new using node_id: {:?}.", &node_id.clone().unwrap());
+            debug!("Routing table not found, creating new using node_id: {:?}.", &node_id.clone().unwrap());
             RoutingTable::new(&node_id.unwrap())
         }
     }
