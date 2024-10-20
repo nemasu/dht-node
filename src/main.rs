@@ -350,29 +350,31 @@ async fn main() -> io::Result<()> {
             routing_table.lock().await.save();
         }
 
-        //Node management
-        routing_table.lock().await.node_remove_dead();
-        let nodes = routing_table.lock().await.node_get_for_ping();
-        for node in nodes {
-            let ping = proto::KRPCMessage::ping(node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
-            
-            if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
-                warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                routing_table.lock().await.remove_node(&node.id);
-            } else {
-                routing_table.lock().await.ping_update(&node.id);
-                trace!("Pinging {:?}", ping);
+        if current_time % 10 == 0 {
+            //Node management
+            routing_table.lock().await.node_remove_dead();
+            let nodes = routing_table.lock().await.node_get_for_ping();
+            for node in nodes {
+                let ping = proto::KRPCMessage::ping(node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
+                
+                if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
+                    warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
+                    routing_table.lock().await.remove_node(&node.id);
+                } else {
+                    routing_table.lock().await.ping_update(&node.id);
+                    trace!("Pinging {:?}", ping);
+                }
             }
-        }
-        let nodes = routing_table.lock().await.node_get_for_refresh();
-        for node in nodes {
-            let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
-            
-            if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
-                warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                routing_table.lock().await.remove_node(&node.id);
-            } else {
-                trace!("{:?}", find_node);
+            let nodes = routing_table.lock().await.node_get_for_refresh();
+            for node in nodes {
+                let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
+                
+                if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
+                    warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
+                    routing_table.lock().await.remove_node(&node.id);
+                } else {
+                    trace!("{:?}", find_node);
+                }
             }
         }
 
