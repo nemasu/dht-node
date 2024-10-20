@@ -1,3 +1,5 @@
+![Build Status](https://github.com/nemasu/dht-node/actions/workflows/rust.yml/badge.svg)
+
 # dht-node
 BitTorrent DHT node.
 
