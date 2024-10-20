@@ -6,7 +6,7 @@ use crate::proto::{self, ByteArray, CompactAddress, CompactNode, CompactNodeList
 
 use crate::bucket::Buckets;
 
-use log::{debug, trace};
+use log::{debug, info, trace};
 
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
@@ -60,10 +60,6 @@ impl RoutingTable {
         );
     }
 
-    pub fn get_node_id(&self) -> NodeId {
-        self.node_id.clone()
-    }
-
     //Save the routing table to a file
     pub fn save(&self) {
 
@@ -102,19 +98,42 @@ impl RoutingTable {
     //Load the routing table from a file
     pub fn load_or_new(cmdline_node_id: Option<NodeId>) -> Self {
 
+        #[allow(unused_assignments)] //Seems silly the compiler complains here.
         let mut node_id: Option<NodeId> = None;
 
-        let path = match cmdline_node_id {
-            Some(id) => {
-                node_id = Some(id.clone());
-                id.to_hex() + ".json"
-            },
-            None => {
-                node_id = Some(NodeId::generate_nodeid());
-                node_id.clone().unwrap().clone().to_hex() + ".json"
-            },
-        };
-        
+        #[allow(unused_assignments)] //Seems silly the compiler complains here.
+        let mut path = None;
+
+        if let Some(id) = cmdline_node_id {
+            node_id = Some(id.clone());
+            path = Some(id.to_hex() + ".json");
+        } else {
+            //Check if there's a .json file in the current working directory
+            let current_dir = std::env::current_dir().unwrap();
+            if let Ok(entries) = std::fs::read_dir(current_dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let check_path = entry.path();
+                        if check_path.is_file() && check_path.extension().and_then(|s| s.to_str()) == Some("json") {
+                            //Use this json file as the routing table
+                            let mut file_name = check_path.file_name().unwrap().to_str().unwrap().to_string();
+                            file_name = file_name.replace(".json", "");
+                            node_id = Some(NodeId::from_hex(file_name.as_str()));
+                            path = Some(node_id.clone().unwrap().clone().to_hex() + ".json");
+                            info!("Found routing table file: {:?}, trying to load...", path.clone().unwrap());
+                        }
+                    }
+                }
+
+                if path.is_none() {
+                    //If not, generate a new node_id
+                    node_id = Some(NodeId::generate_nodeid());
+                    path = Some(node_id.clone().unwrap().clone().to_hex() + ".json");
+                }
+            }
+        }
+
+        let path = path.unwrap();
 
         //Check if the file exists located at path
         if Path::new(&path).exists() {
@@ -385,6 +404,8 @@ impl RoutingTable {
         self.info_hashes.get(info_hash)
     }
 
+    //TODO
+    #[allow(dead_code)]
     pub fn get_all_info_hashes(&self) -> Vec<InfoHash> {
         let mut info_hash_list = Vec::new();
 
@@ -416,13 +437,6 @@ impl RoutingTable {
     pub fn get_sent_token(&self, node_id: &NodeId) -> Option<Token> {
         let token = self.sent_tokens.get(node_id).unwrap().clone();
         Some(token)
-    }
-
-    pub fn update_port(&mut self, node_id: &NodeId, port: u16) {
-        let addr = self.nodes.get(node_id).unwrap().clone();
-        let sockaddr = addr.addr;
-        let new_sockaddr = std::net::SocketAddr::new((*sockaddr.ip()).into(), port);
-        self.nodes.insert(node_id.clone(), CompactAddress::new_from_sockaddr(new_sockaddr));
     }
 }
 
@@ -484,7 +498,6 @@ mod tests {
     fn test_routing_table() {
         let node_id = NodeId::generate_nodeid();
         let mut routing_table = RoutingTable::new(&node_id);
-        let node_id = routing_table.get_node_id();
 
         let addr: SocketAddrV4 = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080);
         let compact_addr = CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(addr));

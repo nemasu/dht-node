@@ -3,7 +3,7 @@ use proto::{CompactAddress, KRPCMessage, KRPCPayload};
 use tokio::net::UdpSocket;
 use std::{io, net::SocketAddr, ops::Deref, sync::Arc};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
-use log::{debug, error, info, trace, warn, LevelFilter};
+use log::{debug, info, trace, warn, LevelFilter};
 
 
 mod proto;
@@ -200,7 +200,7 @@ async fn main() -> io::Result<()> {
                                         //Add node to routing table
                                         inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
                                     }
-                                    KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values: values } => {
+                                    KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values: _ } => {
                                         //Add node to routing table
                                         inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
                                         inner_routing_table.lock().await.add_token(id.clone(), token.clone());
@@ -213,10 +213,10 @@ async fn main() -> io::Result<()> {
                                             }
                                         }
 
-                                        if values.is_some() {
-                                            //TODO
-                                            //Ping the nodes in values, and add the node to info_hash
-                                        }
+                                        //TODO
+                                        //Ping the nodes in values, and add the node to info_hash
+                                        // if values.is_some() {
+                                        // }
                                     }
                                     KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
                                         //Add node to routing table

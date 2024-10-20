@@ -1,4 +1,7 @@
+use core::panic;
 use std::collections::BTreeSet;
+
+use log::error;
 
 use crate::proto::{ByteArray, NodeId};
 
@@ -111,10 +114,11 @@ impl Buckets {
                     }
                 }
 
-                if new_one.max <= new_one.min {
-                    panic!("bucket range error! new_one: {:?}", new_one);
-                } else if new_two.max <= new_two.min {
-                    panic!("bucket range error! new_two: {:?}", new_two);
+                if new_one.max <= new_one.min || new_two.max <= new_two.min {
+                    error!("bucket {:?}", bucket);
+                    error!("bucket range error! new_one: {:?}", new_one);
+                    error!("bucket range error! new_two: {:?}", new_two);
+                    panic!("bucket range error!");
                 }
 
                 self.buckets.insert(new_one);
