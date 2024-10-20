@@ -261,6 +261,10 @@ impl RoutingTable {
 
         for bucket in self.buckets.buckets.iter() {
             if bucket.last_changed + 60*15 < std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
+                if bucket.nodes.len() == 0 {
+                    continue;
+                }
+                
                 let random_index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..bucket.nodes.len());
                 let node_id = bucket.nodes.get(random_index).unwrap();
 
