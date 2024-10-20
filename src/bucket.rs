@@ -35,6 +35,12 @@ impl Buckets {
         let mut is_split = false;
         for bucket in self.buckets.iter() {
             if node_id >= bucket.min && node_id <= bucket.max {
+
+                //If the bucket already contains this node, just return true
+                if bucket.nodes.contains(&node_id) {
+                    return true;
+                }
+
                 bucket_to_change = Some(bucket.min.clone()); //Order/key is based on min
                 if bucket.nodes.len() >= 8 && bucket.nodes.contains(&self.my_node_id) {
                     is_split = true;
