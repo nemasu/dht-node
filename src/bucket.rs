@@ -33,16 +33,15 @@ impl Buckets {
         //Find the bucket that this belongs to
         let mut bucket_to_change = None;
         let mut is_split = false;
+        let mut is_exists = false;
         for bucket in self.buckets.iter() {
             if node_id >= bucket.min && node_id <= bucket.max {
-
-                //If the bucket already contains this node, just return true
-                if bucket.nodes.contains(&node_id) {
-                    return true;
-                }
-
                 bucket_to_change = Some(bucket.min.clone()); //Order/key is based on min
-                if bucket.nodes.len() >= 8 && bucket.nodes.contains(&self.my_node_id) {
+
+                if bucket.nodes.contains(&node_id) {
+                    is_exists = true;
+                    break;
+                } else if bucket.nodes.len() >= 8 && bucket.nodes.contains(&self.my_node_id) {
                     is_split = true;
                 } else if bucket.nodes.len() >= 8 {
                     return false;
@@ -52,8 +51,18 @@ impl Buckets {
             }
         }
 
+        //If the bucket already contains this node, update the last_changed time and return true
+        if is_exists {
+            let to_change = BucketNode::new_for_remove(bucket_to_change.unwrap());
+            let mut bucket = self.buckets.take(&to_change).unwrap();
+            bucket.last_changed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            self.buckets.insert(bucket);
+            return true;
+        }
+
         if bucket_to_change.is_none() {
-            println!("Buckets: {:?}, Node: {:?}", self.buckets, node_id);
+            error!("Buckets: {:?}, Node: {:?}", self.buckets, node_id);
+            panic!("Bucket not found!");
         }
 
         let to_change = BucketNode::new_for_remove(bucket_to_change.unwrap());

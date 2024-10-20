@@ -33,6 +33,13 @@ pub struct RoutingTable {
     pub nodes_time: HashMap<NodeId, (u64,u64)>,
 
     //TODO Keep track of stale/old nodes as backup?
+
+    pub last_printed_nodes_len: usize,
+    pub last_printed_info_hashes_len: usize,
+    pub last_printed_tokens_len: usize,
+    pub last_printed_sent_tokens_len: usize,
+    pub last_printed_nodes_time_len: usize,
+    pub last_printed_buckets_len: usize,
 }
 
 impl RoutingTable {
@@ -46,18 +53,40 @@ impl RoutingTable {
             sent_tokens: HashMap::new(),
             nodes_time: HashMap::new(),
             buckets: Buckets::new(&node_id),
+            last_printed_nodes_len: 0,
+            last_printed_info_hashes_len: 0,
+            last_printed_tokens_len: 0,
+            last_printed_sent_tokens_len: 0,
+            last_printed_nodes_time_len: 0,
+            last_printed_buckets_len: 0,
         }
     }
 
-    pub fn debug_stats(&self) {
-        debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}, bucket size {:?}",
-            self.nodes.len(),
-            self.info_hashes.len(),
-            self.sent_tokens.len(),
-            self.tokens.len(),
-            self.nodes_time.len(),
-            self.buckets.buckets.len(),
-        );
+    pub fn debug_stats(&mut self) {
+
+        if     self.last_printed_nodes_len != self.nodes.len()
+            || self.last_printed_info_hashes_len != self.info_hashes.len()
+            || self.last_printed_tokens_len != self.tokens.len()
+            || self.last_printed_sent_tokens_len != self.sent_tokens.len()
+            || self.last_printed_nodes_time_len != self.nodes_time.len()
+            || self.last_printed_buckets_len != self.buckets.buckets.len() {
+
+                debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}, bucket size {:?}",
+                    self.nodes.len(),
+                    self.info_hashes.len(),
+                    self.sent_tokens.len(),
+                    self.tokens.len(),
+                    self.nodes_time.len(),
+                    self.buckets.buckets.len(),
+                );
+
+                self.last_printed_nodes_len = self.nodes.len();
+                self.last_printed_info_hashes_len = self.info_hashes.len();
+                self.last_printed_tokens_len = self.tokens.len();
+                self.last_printed_sent_tokens_len = self.sent_tokens.len();
+                self.last_printed_nodes_time_len = self.nodes_time.len();
+                self.last_printed_buckets_len = self.buckets.buckets.len();
+        }
     }
 
     //Save the routing table to a file
@@ -150,6 +179,12 @@ impl RoutingTable {
                 sent_tokens: HashMap::new(),
                 nodes_time: HashMap::new(),
                 buckets: Buckets::new(&node_id),
+                last_printed_nodes_len: 0,
+                last_printed_info_hashes_len: 0,
+                last_printed_tokens_len: 0,
+                last_printed_sent_tokens_len: 0,
+                last_printed_nodes_time_len: 0,
+                last_printed_buckets_len: 0,
             };
 
             //Nodes
