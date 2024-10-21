@@ -508,7 +508,6 @@ impl KRPCMessage {
         }
     }
 
-    #[allow(dead_code)]
     pub fn get_peers(node_id: NodeId, info_hash: InfoHash, transaction_id: TransactionId) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryGetPeersRequest {

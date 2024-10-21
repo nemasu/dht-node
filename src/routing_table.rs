@@ -26,11 +26,14 @@ pub struct RoutingTable {
     //Map of node to get_peer response
     pub tokens: HashMap<NodeId, Token>,
 
-    //Map of node to generated tokens sent 
-    pub sent_tokens: HashMap<NodeId, Token>,
-
     //Node -> (last heard from, last refresh time)
     pub nodes_time: HashMap<NodeId, (u64,u64)>,
+
+    //These is used for resolving get_peer responses to node_id
+    //sent TransactionId -> InfoHash
+    pub get_peer_info_hash: HashMap<TransactionId, InfoHash>,
+    //info_hash we're looking for -> address that has it
+    pub ping_info_hash: HashMap<CompactAddress, InfoHash>,
 
     //TODO Keep track of stale/old nodes as backup?
 
@@ -50,9 +53,11 @@ impl RoutingTable {
             nodes: HashMap::new(),
             info_hashes: HashMap::new(),
             tokens: HashMap::new(),
-            sent_tokens: HashMap::new(),
             nodes_time: HashMap::new(),
             buckets: Buckets::new(&node_id),
+            get_peer_info_hash: HashMap::new(),
+            ping_info_hash: HashMap::new(),
+
             last_printed_nodes_len: 0,
             last_printed_info_hashes_len: 0,
             last_printed_tokens_len: 0,
@@ -67,14 +72,12 @@ impl RoutingTable {
         if     self.last_printed_nodes_len != self.nodes.len()
             || self.last_printed_info_hashes_len != self.info_hashes.len()
             || self.last_printed_tokens_len != self.tokens.len()
-            || self.last_printed_sent_tokens_len != self.sent_tokens.len()
             || self.last_printed_nodes_time_len != self.nodes_time.len()
             || self.last_printed_buckets_len != self.buckets.buckets.len() {
 
-                debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, sent_tokens size {:?}, tokens size {:?}, pinged_nodes size {:?}, bucket size {:?}",
+                debug!("Routing Table Stats - nodes size {:?}, info_hashes size {:?}, tokens size {:?}, pinged_nodes size {:?}, bucket size {:?}",
                     self.nodes.len(),
                     self.info_hashes.len(),
-                    self.sent_tokens.len(),
                     self.tokens.len(),
                     self.nodes_time.len(),
                     self.buckets.buckets.len(),
@@ -83,7 +86,6 @@ impl RoutingTable {
                 self.last_printed_nodes_len = self.nodes.len();
                 self.last_printed_info_hashes_len = self.info_hashes.len();
                 self.last_printed_tokens_len = self.tokens.len();
-                self.last_printed_sent_tokens_len = self.sent_tokens.len();
                 self.last_printed_nodes_time_len = self.nodes_time.len();
                 self.last_printed_buckets_len = self.buckets.buckets.len();
         }
@@ -176,9 +178,11 @@ impl RoutingTable {
                 nodes: HashMap::new(),
                 info_hashes: HashMap::new(),
                 tokens: HashMap::new(),
-                sent_tokens: HashMap::new(),
                 nodes_time: HashMap::new(),
                 buckets: Buckets::new(&node_id),
+                get_peer_info_hash: HashMap::new(),
+                ping_info_hash: HashMap::new(),
+
                 last_printed_nodes_len: 0,
                 last_printed_info_hashes_len: 0,
                 last_printed_tokens_len: 0,
@@ -304,6 +308,8 @@ impl RoutingTable {
     pub fn remove_node(&mut self, node_id: &NodeId) {
         trace!("Removing node: {:?}", node_id);
 
+        let addr = self.nodes.get(node_id).unwrap().clone();
+
         self.nodes.remove(node_id);
 
         //Remove the hashset entry from info_hashes
@@ -317,11 +323,12 @@ impl RoutingTable {
 
         self.tokens.remove(node_id);
 
-        self.sent_tokens.remove(node_id);
-
         self.nodes_time.remove(node_id);
 
-        self.buckets.remove(node_id);   
+        self.buckets.remove(node_id);
+
+        self.ping_info_hash.remove(&addr);
+        
     }
 
     pub fn remove_node_by_addr(&mut self, addr: &CompactAddress) {
@@ -443,39 +450,19 @@ impl RoutingTable {
         self.info_hashes.get(info_hash)
     }
 
-    //TODO
-    #[allow(dead_code)]
-    pub fn get_all_info_hashes(&self) -> Vec<InfoHash> {
-        let mut info_hash_list = Vec::new();
-
-        for info_hash in self.info_hashes.keys() {
-            info_hash_list.push(info_hash.clone());
-        }
-
-        info_hash_list
-    }
-
-    pub fn add_token(&mut self, node_id: NodeId, token: Token) {
+    pub fn generate_token(&mut self, node_id: &NodeId) -> Token {
+        let token = ByteArray::generate(4);
         self.node_time_update(&node_id);
-        self.tokens.insert(node_id, token);
+        self.tokens.insert(node_id.clone(), token.clone());
+        token
     }
 
     pub fn get_token(&mut self, node_id: &NodeId) -> Option<&Token> {
-        if !self.tokens.contains_key(node_id) {
-            let token = proto::Token::generate(4);
-            self.tokens.insert(node_id.clone(), token);
-        }
         self.tokens.get(node_id)
     }
 
-    pub fn add_sent_token(&mut self, node_id: &NodeId, token: Token) {
-        self.node_time_update(&node_id);
-        self.sent_tokens.insert(node_id.clone(), token);
-    }
-
-    pub fn get_sent_token(&self, node_id: &NodeId) -> Option<Token> {
-        let token = self.sent_tokens.get(node_id).unwrap().clone();
-        Some(token)
+    pub fn remove_token(&mut self, node_id: &NodeId) {
+        self.tokens.remove(node_id);
     }
 }
 

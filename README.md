@@ -8,7 +8,6 @@ This is a standalone client for Mainline DHT. ([BEP-0005](https://www.bittorrent
 It uses [Bendy](https://github.com/P3KI/bendy) for bencode serialization/deserialization.
 
 It is mostly in a working state, but a few improvements can be made:
-- Better info_hash tracking.
 - Transaction ID confirmation.
 - Old/stale node storage.
 - IPV6 support
