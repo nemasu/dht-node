@@ -345,7 +345,7 @@ async fn main() -> io::Result<()> {
     let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let mut last_nodes_count = routing_table.lock().await.nodes.len();
     loop {
-        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 5);
+        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 3);
         for node in nodes {
             let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
             
@@ -357,7 +357,7 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         let nodes_size = routing_table.lock().await.nodes.len();
         if nodes_size == last_nodes_count {
@@ -367,68 +367,62 @@ async fn main() -> io::Result<()> {
         }
 
         //We should give up after a certain period of time.
-        if std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - start_time > 60 {
+        if std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - start_time > 25 {
             break;
         }
     }
 
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
     loop {
-        
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        interval.tick().await;
+       
+        routing_table.lock().await.debug_stats();
+        routing_table.lock().await.save();
 
-        if current_time % 30 == 0 {
-            routing_table.lock().await.debug_stats();
-            routing_table.lock().await.save();
-        }
-
-        if current_time % 10 == 0 {
-            //Node management
-            routing_table.lock().await.node_remove_dead();
-            let nodes = routing_table.lock().await.node_get_for_ping();
-            for node in nodes {
-                let ping = proto::KRPCMessage::ping(node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
-                
-                if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
-                    warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                    routing_table.lock().await.remove_node(&node.id);
-                } else {
-                    routing_table.lock().await.ping_update(&node.id);
-                    trace!("Pinging {:?}", ping);
-                }
-            }
+        //Node management
+        routing_table.lock().await.node_remove_dead();
+        let nodes = routing_table.lock().await.node_get_for_ping();
+        for node in nodes {
+            let ping = proto::KRPCMessage::ping(node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
             
-            //Refreshing bucket uses a random node in the bucket to find a randomly generated node in the bucket's range.
-            let nodes = routing_table.lock().await.node_get_for_refresh();
-            for (node, random_target) in nodes {
-                let find_node = proto::KRPCMessage::find_node(node_id.clone(), random_target, transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
-                
-                if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
-                    warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                    routing_table.lock().await.remove_node(&node.id);
-                } else {
-                    trace!("{:?}", find_node);
-                }
+            if let Err(e) = s.send_to(&ping.to_bencode().unwrap(), node.addr.addr).await {
+                warn!("Error sending ping: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
+                routing_table.lock().await.remove_node(&node.id);
+            } else {
+                routing_table.lock().await.ping_update(&node.id);
+                trace!("Pinging {:?}", ping);
+            }
+        }
+        
+        //Refreshing bucket uses a random node in the bucket to find a randomly generated node in the bucket's range.
+        let nodes = routing_table.lock().await.node_get_for_refresh();
+        for (node, random_target) in nodes {
+            let find_node = proto::KRPCMessage::find_node(node_id.clone(), random_target, transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
+            
+            if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
+                warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
+                routing_table.lock().await.remove_node(&node.id);
+            } else {
+                trace!("{:?}", find_node);
             }
         }
 
-        if current_time % 30 == 0 {
-            //Call get_peers for each info_hash we have stored if there are none.
-            let info_hashes = routing_table.lock().await.info_hashes.clone();
-            for (info_hash, node_set) in info_hashes.iter() {
-                if node_set.len() == 0 {
-                    let nodes = routing_table.lock().await.get_closest_nodes(&info_hash.clone(), 3);
-                    for node in nodes {
-                        let transaction_id = transaction_counter.lock().await.get_transaction_id(node.addr.clone());
-                        routing_table.lock().await.get_peer_info_hash.insert(transaction_id.clone(), info_hash.clone());
-                        let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), info_hash.clone(), transaction_id.clone());
-                        
-                        if let Err(e) = s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await {
-                            warn!("Error sending get_peers: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
-                            routing_table.lock().await.remove_node(&node.id);
-                        } else {
-                            trace!("{:?}", get_peers);
-                        }
+        //Call get_peers for each info_hash we have stored if there are none.
+        let info_hashes = routing_table.lock().await.info_hashes.clone();
+        for (info_hash, node_set) in info_hashes.iter() {
+            if node_set.len() == 0 {
+                let nodes = routing_table.lock().await.get_closest_nodes(&info_hash.clone(), 3);
+                for node in nodes {
+                    let transaction_id = transaction_counter.lock().await.get_transaction_id(node.addr.clone());
+                    routing_table.lock().await.get_peer_info_hash.insert(transaction_id.clone(), info_hash.clone());
+                    let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), info_hash.clone(), transaction_id.clone());
+                    
+                    if let Err(e) = s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await {
+                        warn!("Error sending get_peers: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
+                        routing_table.lock().await.remove_node(&node.id);
+                    } else {
+                        trace!("{:?}", get_peers);
                     }
                 }
             }

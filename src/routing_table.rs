@@ -245,8 +245,8 @@ impl RoutingTable {
         let mut nodes_to_ping = Vec::new();
         for (node_id, addr) in &self.nodes {
             if let Some(time) = self.nodes_time.get(node_id) {
-                //Ping node if it has not communicated in 11 minutes, and it has not been pinged in the last minute
-                if (current_time as i64 - time.0 as i64) > (60*11) && (current_time as i64 - time.1 as i64) > 60 {
+                //Ping node if it has not communicated in 15 minutes, and it has not been pinged in the last minute
+                if (current_time as i64 - time.0 as i64) > (60*15) && (current_time as i64 - time.1 as i64) > 60 {
                     nodes_to_ping.push(CompactNode::new(node_id.clone(), addr.clone()));
                 }
             } else {
@@ -293,8 +293,8 @@ impl RoutingTable {
         let mut nodes_to_remove = Vec::new();
 
         for (node_id, time) in &self.nodes_time {
-            //Remove node if it has not responded in 15  minutes
-            if current_time as i64 - time.0 as i64 > (60*15) {
+            //Remove node if it has not responded in 17  minutes
+            if current_time as i64 - time.0 as i64 > (60*17) {
                 trace!("Node {} has not responded. Last message @ {}, last ping @ {}", node_id, time.0, time.1);
                 nodes_to_remove.push(node_id.clone());
             }
