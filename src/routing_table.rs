@@ -257,7 +257,7 @@ impl RoutingTable {
         nodes_to_ping
     }
 
-    pub fn node_get_for_refresh(&mut self) ->Vec<CompactNode> {
+    pub fn node_get_for_refresh(&mut self) ->Vec<(CompactNode,NodeId)> {
         let mut to_refresh = Vec::new();
 
         for bucket in self.buckets.buckets.iter() {
@@ -266,11 +266,15 @@ impl RoutingTable {
                     continue;
                 }
                 
+                //Destination node_id is a random node_id in the bucket
                 let random_index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..bucket.nodes.len());
-                let node_id = bucket.nodes.get(random_index).unwrap();
+                let dest_node_id = bucket.nodes.get(random_index).unwrap();
 
-                let addr = self.nodes.get(node_id).unwrap();
-                to_refresh.push(CompactNode::new(node_id.clone(), addr.clone()));
+                //Target node_id is a random node_id in the bucket's range
+                let rand_node_id = ByteArray::generate_range(bucket.min.clone(), bucket.max.clone());
+
+                let addr = self.nodes.get(dest_node_id).unwrap();
+                to_refresh.push((CompactNode::new(dest_node_id.clone(), addr.clone()), rand_node_id));
             }
         }
 

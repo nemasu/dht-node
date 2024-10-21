@@ -26,6 +26,21 @@ impl ByteArray {
         ByteArray(id_bytes)
     }
 
+    pub fn generate_range(min: ByteArray, max: ByteArray) -> ByteArray {
+        let mut rng = rand::thread_rng();
+        
+        let mut difference = ByteArray::subtract(&max, &min);
+        for byte in &mut difference.0 {
+            *byte = rng.gen_range(0..=*byte); 
+        }
+
+        let ret = ByteArray::add(&min, &difference);
+
+        assert!(ret >= min);
+        assert!(ret <= max);
+        ret
+    }
+
     pub fn generate_nodeid() -> ByteArray {
         ByteArray::generate(20)
     }
@@ -1028,6 +1043,22 @@ mod tests {
         println!("{:?}", decoded);
 
         assert_eq!(node_id, decoded);
+    }
+
+    #[test]
+    fn test_bytearray_random_range() {
+        let a = ByteArray::generate(20);
+        let b = ByteArray::generate(20);
+
+        if a > b {
+            println!("{:?} > {:?}", b, a);
+            let r = ByteArray::generate_range(b, a);
+            println!("{:?}", r);
+        } else {
+            println!("{:?} > {:?}", a, b);
+            let r = ByteArray::generate_range(a, b);
+            println!("{:?}", r);
+        }
     }
 
     #[test]

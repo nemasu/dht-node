@@ -384,11 +384,10 @@ async fn main() -> io::Result<()> {
                 }
             }
             
-            //Refreshing bucket uses a random ID in the range, and sends a find_node query for that node.
-            //TODO Currently this is a random node we have in the bucket until I add a way to generate random node_ids in a range.
+            //Refreshing bucket uses a random node in the bucket to find a randomly generated node in the bucket's range.
             let nodes = routing_table.lock().await.node_get_for_refresh();
-            for node in nodes {
-                let find_node = proto::KRPCMessage::find_node(node_id.clone(), node.id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
+            for (node, random_target) in nodes {
+                let find_node = proto::KRPCMessage::find_node(node_id.clone(), random_target, transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
                 
                 if let Err(e) = s.send_to(&find_node.to_bencode().unwrap(), node.addr.addr).await {
                     warn!("Error sending find_node: {:?} to {:?}, removing node {:?}.", e, node.addr, node);
