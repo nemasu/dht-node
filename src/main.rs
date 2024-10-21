@@ -400,13 +400,13 @@ async fn main() -> io::Result<()> {
 
         if current_time % 30 == 0 {
             //Call get_peers for each info_hash we have stored if there are none.
-            for (info_hash, node_set) in routing_table.lock().await.info_hashes.iter() {
+            let info_hashes = routing_table.lock().await.info_hashes.clone();
+            for (info_hash, node_set) in info_hashes.iter() {
                 if node_set.len() == 0 {
                     let nodes = routing_table.lock().await.get_closest_nodes(&info_hash.clone(), 3);
                     for node in nodes {
                         let transaction_id = transaction_counter.lock().await.get_transaction_id(node.addr.clone());
                         routing_table.lock().await.get_peer_info_hash.insert(transaction_id.clone(), info_hash.clone());
-
                         let get_peers = proto::KRPCMessage::get_peers(node_id.clone(), info_hash.clone(), transaction_id.clone());
                         
                         if let Err(e) = s.send_to(&get_peers.to_bencode().unwrap(), node.addr.addr).await {
