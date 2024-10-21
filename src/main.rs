@@ -192,8 +192,22 @@ async fn main() -> io::Result<()> {
                                 match msg.payload {
                                     //TODO check the transaction id
                                     KRPCPayload::KRPCQueryIdResponse { id, port: _, ip: _ } => {
-                                        //Add node to routing table
                                         let addr = CompactAddress::new_from_sockaddr(addr);
+
+                                        {
+                                            //Check if the node_id has changed
+                                            let mut rt = inner_routing_table.lock().await;
+                                            let node_local = rt.get_node(&id.clone());
+                                            if node_local.is_some() {
+                                                let node_local = node_local.unwrap();
+                                                if *node_local != addr {
+                                                    debug!("Node {:?} has changed address from {:?} to {:?}, updating.", id, node_local.addr, addr);
+                                                    rt.remove_node(&id);
+                                                }
+                                            }
+                                        }
+
+                                        //Add node to routing table
                                         inner_routing_table.lock().await.add_node(id.clone(), addr.clone());
 
                                         //If this ping response was a result of a get_peers value check, add the node to the info_hash
