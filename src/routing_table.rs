@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use json;
 
-use crate::proto::{self, ByteArray, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token, TransactionId};
+use crate::proto::{ByteArray, CompactAddress, CompactNode, CompactNodeList, InfoHash, NodeId, Token, TransactionId};
 
 use crate::bucket::Buckets;
 
@@ -40,7 +40,6 @@ pub struct RoutingTable {
     pub last_printed_nodes_len: usize,
     pub last_printed_info_hashes_len: usize,
     pub last_printed_tokens_len: usize,
-    pub last_printed_sent_tokens_len: usize,
     pub last_printed_nodes_time_len: usize,
     pub last_printed_buckets_len: usize,
 }
@@ -61,7 +60,6 @@ impl RoutingTable {
             last_printed_nodes_len: 0,
             last_printed_info_hashes_len: 0,
             last_printed_tokens_len: 0,
-            last_printed_sent_tokens_len: 0,
             last_printed_nodes_time_len: 0,
             last_printed_buckets_len: 0,
         }
@@ -186,7 +184,6 @@ impl RoutingTable {
                 last_printed_nodes_len: 0,
                 last_printed_info_hashes_len: 0,
                 last_printed_tokens_len: 0,
-                last_printed_sent_tokens_len: 0,
                 last_printed_nodes_time_len: 0,
                 last_printed_buckets_len: 0,
             };
