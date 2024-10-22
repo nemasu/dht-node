@@ -206,7 +206,7 @@ async fn main() -> io::Result<()> {
 
                                                     if id == inner_node_id {
                                                         if msg.version.is_some() && msg.version.clone().unwrap() == invalid_ping_response_version {
-                                                            debug!("Node {:?} with version {:?} is replying to pings with our node_id, ignoring.", id, msg.version);
+                                                            debug!("Node with version {:?} is replying to pings with our node_id, ignoring.", msg.version.unwrap());
                                                         } else {
                                                             error!("Node_id is being used by another node {:?}, exiting.", id);
                                                             std::process::exit(1);
