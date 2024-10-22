@@ -3,7 +3,7 @@ use proto::{CompactAddress, KRPCMessage, KRPCPayload};
 use tokio::net::UdpSocket;
 use std::{io, net::SocketAddr, ops::Deref, sync::Arc};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
-use log::{debug, info, trace, warn, LevelFilter};
+use log::{debug, error, info, trace, warn, LevelFilter};
 
 
 mod proto;
@@ -29,6 +29,8 @@ async fn resolve_hostname(hostname: &str) -> Option<SocketAddr> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let invalid_ping_response_version = proto::Version::from_hex("4c540101");
+
     TermLogger::init(LevelFilter::Debug, Config::default(), TerminalMode::Mixed, ColorChoice::Auto).unwrap();
 
     #[allow(unused_assignments)] //Seems silly the compiler complains here.
@@ -121,7 +123,7 @@ async fn main() -> io::Result<()> {
                                     }
                                     "announce_peer" => {
                                         if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port: _, token, implied_port: _, seed: _ } = msg.payload {
-                                            debug!("Received announce_peer from {:?} for info_hash {:?} with token {:?}", id, info_hash, token);
+                                            debug!("Received announce_peer from {:?} for info_hash {:?}", id, info_hash);
                                             
                                             //check token
                                             let sent_token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
@@ -201,20 +203,31 @@ async fn main() -> io::Result<()> {
                                             if node_local.is_some() {
                                                 let node_local = node_local.unwrap();
                                                 if *node_local != addr {
-                                                    debug!("Node {:?} has changed address from {:?} to {:?}, updating.", id, node_local.addr, addr);
-                                                    rt.remove_node(&id);
+
+                                                    if id == inner_node_id {
+                                                        if msg.version.is_some() && msg.version.clone().unwrap() == invalid_ping_response_version {
+                                                            debug!("Node {:?} with version {:?} is replying to pings with our node_id, ignoring.", id, msg.version);
+                                                        } else {
+                                                            error!("Node_id is being used by another node {:?}, exiting.", id);
+                                                            std::process::exit(1);
+                                                        }
+                                                    } else {
+                                                        debug!("Node {:?} has changed address from {:?} to {:?}, updating.", id, node_local.addr, addr);
+                                                        rt.remove_node(&id);
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        //Add node to routing table
-                                        inner_routing_table.lock().await.add_node(id.clone(), addr.clone());
+                                            //Add node to routing table
+                                            rt.add_node(id.clone(), addr.clone());
+                                        }
 
                                         //If this ping response was a result of a get_peers value check, add the node to the info_hash
                                         if inner_routing_table.lock().await.ping_info_hash.contains_key(&addr) {
-                                            let info_hash = inner_routing_table.lock().await.ping_info_hash.get(&addr).unwrap().clone();
-                                            inner_routing_table.lock().await.add_info_hash(info_hash.clone(), id.clone());
-                                            inner_routing_table.lock().await.ping_info_hash.remove(&addr);
+                                            let mut rt = inner_routing_table.lock().await;
+                                            let info_hash = rt.ping_info_hash.get(&addr).unwrap().clone();
+                                            rt.add_info_hash(info_hash.clone(), id.clone());
+                                            rt.ping_info_hash.remove(&addr);
                                         }
                                     }
                                     KRPCPayload::KRPCQueryGetPeersResponse { id, token: _, nodes, values } => {

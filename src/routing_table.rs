@@ -6,7 +6,9 @@ use crate::proto::{ByteArray, CompactAddress, CompactNode, CompactNodeList, Info
 
 use crate::bucket::Buckets;
 
-use log::{debug, info, trace};
+use log::{debug, error, trace, warn};
+
+const PATH: &str = "rt.json";
 
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
@@ -92,13 +94,8 @@ impl RoutingTable {
     //Save the routing table to a file
     pub fn save(&self) {
 
-        let path = self.node_id.to_hex() + ".json";
-
-        //NodeId
         let mut data = json::object!{
-            node_id: self.node_id.to_hex(),
             nodes: {},
-            info_hashes: {},
         };
 
         //Nodes
@@ -110,18 +107,9 @@ impl RoutingTable {
             };
         }
 
-        //info_hashes
-        for (info_hash, node_set) in &self.info_hashes {
-            let mut node_set_hex = Vec::new();
-            for node_id in node_set {
-                node_set_hex.push(node_id.to_hex());
-            }
-            data["info_hashes"][info_hash.to_hex()] = json::array!(node_set_hex);
-        }
+        //node_id, info_hashes, node_times, tokens and sent_tokens are not saved
 
-        //node_times, tokens and sent_tokens are not saved
-
-        std::fs::write(path, data.dump()).unwrap();
+        std::fs::write(PATH, data.dump()).unwrap();
     }
 
     //Load the routing table from a file
@@ -130,47 +118,20 @@ impl RoutingTable {
         #[allow(unused_assignments)] //Seems silly the compiler complains here.
         let mut node_id: Option<NodeId> = None;
 
-        #[allow(unused_assignments)] //Seems silly the compiler complains here.
-        let mut path = None;
-
         if let Some(id) = cmdline_node_id {
             node_id = Some(id.clone());
-            path = Some(id.to_hex() + ".json");
         } else {
-            //Check if there's a .json file in the current working directory
-            let current_dir = std::env::current_dir().unwrap();
-            if let Ok(entries) = std::fs::read_dir(current_dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let check_path = entry.path();
-                        if check_path.is_file() && check_path.extension().and_then(|s| s.to_str()) == Some("json") {
-                            //Use this json file as the routing table
-                            let mut file_name = check_path.file_name().unwrap().to_str().unwrap().to_string();
-                            file_name = file_name.replace(".json", "");
-                            node_id = Some(NodeId::from_hex(file_name.as_str()));
-                            path = Some(node_id.clone().unwrap().clone().to_hex() + ".json");
-                            info!("Found routing table file: {:?}, trying to load...", path.clone().unwrap());
-                        }
-                    }
-                }
-
-                if path.is_none() {
-                    //If not, generate a new node_id
-                    node_id = Some(NodeId::generate_nodeid());
-                    path = Some(node_id.clone().unwrap().clone().to_hex() + ".json");
-                }
-            }
+            //If not, generate a new node_id
+            node_id = Some(NodeId::generate_nodeid());
         }
 
-        let path = path.unwrap();
-
         //Check if the file exists located at path
-        if Path::new(&path).exists() {
+        if Path::new(PATH).exists() {
             //Load the file
-            let data = json::parse(std::fs::read_to_string(path).unwrap().as_str()).unwrap();
+            let data = json::parse(std::fs::read_to_string(PATH).unwrap().as_str()).unwrap();
 
             //NodeId
-            let node_id = NodeId::from_hex(data["node_id"].as_str().unwrap());
+            let node_id = node_id.unwrap();
             let mut routing_table = RoutingTable {
                 node_id: node_id.clone(),
                 nodes: HashMap::new(),
@@ -195,19 +156,6 @@ impl RoutingTable {
                 routing_table.nodes.insert(node_id, addr);
             }
 
-            //info_hashes
-            for (info_hash_hex, node_set) in data["info_hashes"].entries() {
-                let info_hash = InfoHash::from_hex(info_hash_hex);
-                let mut node_set_data = HashSet::new();
-                for node_ids in node_set.members() {
-                    for node_id_hex in node_ids.members() {
-                        let node_id = NodeId::from_hex(node_id_hex.as_str().unwrap());
-                        node_set_data.insert(node_id);
-                    }
-                }
-                routing_table.info_hashes.insert(info_hash, node_set_data);
-            }
-
             //Insert nodes into buckets
             let mut nodes_to_remove = Vec::new();
             for (node_id, _) in &routing_table.nodes {
@@ -219,12 +167,12 @@ impl RoutingTable {
                 routing_table.remove_node(&node_id);
             }
 
-            debug!("Loaded routing table.");
+            debug!("Loaded routing table, node_id: {:?}.", &node_id.clone());
 
             routing_table
 
         } else {
-            debug!("Routing table not found, creating new using node_id: {:?}.", &node_id.clone().unwrap());
+            debug!("Routing table not found, node_id: {:?}.", &node_id.clone().unwrap());
             RoutingTable::new(&node_id.unwrap())
         }
     }
@@ -273,8 +221,11 @@ impl RoutingTable {
                 //Target node_id is a random node_id in the bucket's range
                 let rand_node_id = ByteArray::generate_range(bucket.min.clone(), bucket.max.clone());
 
-                let addr = self.nodes.get(dest_node_id).unwrap();
-                to_refresh.push((CompactNode::new(dest_node_id.clone(), addr.clone()), rand_node_id));
+                if let Some(addr) = self.nodes.get(dest_node_id) {
+                    to_refresh.push((CompactNode::new(dest_node_id.clone(), addr.clone()), rand_node_id));
+                } else {
+                    warn!("node_get_for_refresh: Node {:?} not found in nodes map.", dest_node_id);
+                }
             }
         }
 
@@ -482,7 +433,8 @@ impl TransactionCounter {
 
     pub fn get_addr_for_tranaction_id(&self, id: TransactionId) -> Option<&CompactAddress> {
         if id.0.len() != 4 {
-            panic!("TransactionId is not 4 bytes long");
+            error!("TransactionId is not 4 bytes long");
+            std::process::exit(1);
         }
 
         //Convert id to i32 and get the address from the map

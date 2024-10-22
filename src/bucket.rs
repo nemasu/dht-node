@@ -1,4 +1,3 @@
-use core::panic;
 use std::collections::BTreeSet;
 
 use log::error;
@@ -62,7 +61,8 @@ impl Buckets {
 
         if bucket_to_change.is_none() {
             error!("Buckets: {:?}, Node: {:?}", self.buckets, node_id);
-            panic!("Bucket not found!");
+            error!("Bucket not found!");
+            std::process::exit(1);
         }
 
         let to_change = BucketNode::new_for_remove(bucket_to_change.unwrap());
@@ -133,7 +133,8 @@ impl Buckets {
                     error!("bucket {:?}", bucket);
                     error!("bucket range error! new_one: {:?}", new_one);
                     error!("bucket range error! new_two: {:?}", new_two);
-                    panic!("bucket range error!");
+                    error!("bucket range error!");
+                    std::process::exit(1);
                 }
 
                 self.buckets.insert(new_one);

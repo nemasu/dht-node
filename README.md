@@ -12,11 +12,11 @@ It is mostly in a working state, but a few improvements can be made:
 - Old/stale node storage.
 - IPV6 support
 
-The routing table is stored in a JSON file in the working directory as: `<node_id_in_hex>.json`
+The routing table is stored in a JSON file in the working directory as: `rt.json`
 
 Usage:
 `dht-node <ip>:<port> <node_id>`
 or
 `dht-node <ip>:<port>`
 
-If no node_id is provided, the working directory will be searched for a JSON file to use, if none are found a new node_id will be generated.
+If no node_id is provided, a new node_id will be generated.
