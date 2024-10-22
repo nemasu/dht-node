@@ -162,6 +162,15 @@ impl Buckets {
         bucket.nodes.retain(|x| *x != *node_id);
         self.buckets.insert(bucket);
     }
+
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        let mut count = 0;
+        for bucket in self.buckets.iter() {
+            count += bucket.nodes.len();
+        }
+        count
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +222,47 @@ impl Eq for BucketNode { }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bucket_remove() {
+        let mut buckets = Buckets::new(&NodeId::from_hex("2f 93 f9 66 9e fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5c"));
+
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5d"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5e"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5f"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 60"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 61"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 62"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 63"));
+        buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 64"));
+        assert_eq!(buckets.add(NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 65")), false);
+
+
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5d"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5e"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5f"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 60"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 61"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 62"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 63"));
+        buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 64"));
+        assert_eq!(buckets.add(NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 65")), false);
+        
+
+        println!("{:?}", buckets.buckets);
+        assert_eq!(buckets.count(), 17);
+        
+        buckets.remove(&NodeId::from_hex("00 00 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 5d"));
+        println!("{:?}", buckets.buckets);
+        
+        assert_eq!(buckets.count(), 16);
+
+        buckets.remove(&NodeId::from_hex("30 FF 00 00 00 fa 5b e2 04 8f 82 89 34 dc 0a c4 76 2d 8a 61"));
+
+        assert_eq!(buckets.count(), 15);
+        println!("{:?}", buckets.buckets);
+        
+    }
 
     #[test]
     fn test_bucket() {

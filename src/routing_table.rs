@@ -218,6 +218,12 @@ impl RoutingTable {
                 let random_index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..bucket.nodes.len());
                 let dest_node_id = bucket.nodes.get(random_index).unwrap();
 
+                //Skip our own node_id
+                if *dest_node_id == self.node_id {
+                    trace!("node_get_for_refresh: Skipping our own node_id.");
+                    continue;
+                }
+
                 //Target node_id is a random node_id in the bucket's range
                 let rand_node_id = ByteArray::generate_range(bucket.min.clone(), bucket.max.clone());
 
