@@ -348,9 +348,11 @@ impl RoutingTable {
     }
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
-        self.node_time_update(&node_id);
-        self.nodes.insert(node_id.clone(), addr);
-        self.buckets.add(node_id.clone());
+        //Only add this node if it's added to a bucket.
+        if self.buckets.add(node_id.clone()) {
+            self.node_time_update(&node_id);
+            self.nodes.insert(node_id.clone(), addr);
+        }
     }
 
     pub fn get_node(&self, node_id: &NodeId) -> Option<&CompactAddress> {

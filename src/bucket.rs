@@ -39,7 +39,6 @@ impl Buckets {
 
                 if bucket.nodes.contains(&node_id) {
                     is_exists = true;
-                    break;
                 } else if bucket.nodes.len() >= 8 && bucket.nodes.contains(&self.my_node_id) {
                     is_split = true;
                 } else if bucket.nodes.len() >= 8 {
