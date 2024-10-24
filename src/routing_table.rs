@@ -115,9 +115,7 @@ impl RoutingTable {
     //Load the routing table from a file
     pub fn load_or_new(cmdline_node_id: Option<NodeId>) -> Self {
 
-        #[allow(unused_assignments)] //Seems silly the compiler complains here.
-        let mut node_id: Option<NodeId> = None;
-
+        let node_id: Option<NodeId>;
         if let Some(id) = cmdline_node_id {
             node_id = Some(id.clone());
         } else {
@@ -305,12 +303,13 @@ impl RoutingTable {
 
     //used for get_peers response
     pub fn get_node_list_for_info_hash(&self, info_hash: &InfoHash) -> (CompactNodeList, Option<Vec<CompactAddress>>){
-        let mut value_list = Vec::new();
+        let mut value_list = None;
 
         if let Some(node_set) = self.get_info_hash(info_hash) {
+            value_list = Some(Vec::new());
             for node_id in node_set {
                 if let Some(addr) = self.get_node(node_id) {
-                    value_list.push(addr.clone());
+                    value_list.as_mut().unwrap().push(addr.clone());
                 }
             }
         }
@@ -327,7 +326,7 @@ impl RoutingTable {
         let lowest_nodes = node_list.iter().take(8).map(|(_, node)| node.clone()).collect::<Vec<CompactNode>>();
         let compact_node_list = CompactNodeList::new_from_vec(lowest_nodes);
                 
-        (compact_node_list, Some(value_list))
+        (compact_node_list, value_list)
     }
 
     //used for find_node response

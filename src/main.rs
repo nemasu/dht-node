@@ -33,9 +33,8 @@ async fn main() -> io::Result<()> {
 
     TermLogger::init(LevelFilter::Debug, Config::default(), TerminalMode::Mixed, ColorChoice::Auto).unwrap();
 
-    #[allow(unused_assignments)] //Seems silly the compiler complains here.
-    let mut addr = None;
-    let mut node_id = None;
+    let addr;
+    let node_id;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.get(0).map(|r| r.deref()) {
@@ -44,6 +43,8 @@ async fn main() -> io::Result<()> {
 
             if args.len() > 1 {
                 node_id = Some(proto::NodeId::from_hex(args.get(1).unwrap()));
+            } else {
+                node_id = None;
             }
         }
         _ => {
@@ -89,7 +90,7 @@ async fn main() -> io::Result<()> {
                                             inner_routing_table.lock().await.ping_update(&id.clone());
 
                                             //Response
-                                            let ping_response = proto::KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
+                                            let ping_response = proto::KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(addr));
                                             
                                             trace!("sending ping response: {:?}", ping_response);
                                             
@@ -111,7 +112,7 @@ async fn main() -> io::Result<()> {
                                             let token = inner_routing_table.lock().await.generate_token(&id);
 
                                             //Response
-                                            let get_peers_response = KRPCMessage::get_peers_response(inner_node_id.clone(), token, nodes, msg.transaction_id, values);
+                                            let get_peers_response = KRPCMessage::get_peers_response(inner_node_id.clone(), token, nodes, msg.transaction_id, values, CompactAddress::new_from_sockaddr(addr));
 
                                             trace!("sending get_peers response: {:?}", get_peers_response);
 
@@ -122,9 +123,9 @@ async fn main() -> io::Result<()> {
                                         }
                                     }
                                     "announce_peer" => {
-                                        if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port: _, token, implied_port: _, seed: _ } = msg.payload {
+                                        if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port: _, token, implied_port: _, seed: _ } = msg.payload { // Port, implied_port and seed are ignored, because we are not downloading torrents.
                                             debug!("Received announce_peer from {:?} for info_hash {:?}", id, info_hash);
-                                            
+
                                             //check token
                                             let sent_token = inner_routing_table.lock().await.get_token(&id).unwrap().clone();
                                             if sent_token != token {
@@ -145,7 +146,7 @@ async fn main() -> io::Result<()> {
                                             inner_routing_table.lock().await.add_info_hash(info_hash.clone(), id.clone());
 
                                             //Response
-                                            let get_peers_response = KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id);
+                                            let get_peers_response = KRPCMessage::id_response(inner_node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(addr));
 
                                             trace!("sending annouce_peers response: {:?}", get_peers_response);
 
@@ -166,7 +167,7 @@ async fn main() -> io::Result<()> {
                                             let nodes = inner_routing_table.lock().await.get_node_list_for_node_id(&target);
                                             
                                             //Response
-                                            let find_node_response = KRPCMessage::find_node_response(inner_node_id.clone(), nodes, msg.transaction_id);
+                                            let find_node_response = KRPCMessage::find_node_response(inner_node_id.clone(), nodes, msg.transaction_id, CompactAddress::new_from_sockaddr(addr));
 
                                             trace!("sending find_node response: {:?}", find_node_response);
 
@@ -193,15 +194,14 @@ async fn main() -> io::Result<()> {
                             "r" => {
                                 match msg.payload {
                                     //TODO check the transaction id
-                                    KRPCPayload::KRPCQueryIdResponse { id, port: _, ip: _ } => {
+                                    KRPCPayload::KRPCQueryIdResponse {id, p: _ } => { //P is this hosts port
                                         let addr = CompactAddress::new_from_sockaddr(addr);
 
                                         {
                                             //Check if the node_id has changed
                                             let mut rt = inner_routing_table.lock().await;
                                             let node_local = rt.get_node(&id.clone());
-                                            if node_local.is_some() {
-                                                let node_local = node_local.unwrap();
+                                            if let Some(node_local) = node_local {
                                                 if *node_local != addr {
 
                                                     if id == inner_node_id {
@@ -230,7 +230,7 @@ async fn main() -> io::Result<()> {
                                             rt.ping_info_hash.remove(&addr);
                                         }
                                     }
-                                    KRPCPayload::KRPCQueryGetPeersResponse { id, token: _, nodes, values } => {
+                                    KRPCPayload::KRPCQueryGetPeersResponse { id, token: _, nodes, values, p: _ } => {
                                         //Token is ignored, we don't send announce_peer requests
                                         
                                         //Add node to routing table
@@ -263,7 +263,7 @@ async fn main() -> io::Result<()> {
                                         }
                                         inner_routing_table.lock().await.get_peer_info_hash.remove(&msg.transaction_id);
                                     }
-                                    KRPCPayload::KRPCQueryFindNodeResponse { id, nodes } => {
+                                    KRPCPayload::KRPCQueryFindNodeResponse {id,nodes, p: _ } => {
                                         //Add node to routing table
                                         inner_routing_table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(addr));
 
@@ -358,7 +358,7 @@ async fn main() -> io::Result<()> {
     let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let mut last_nodes_count = routing_table.lock().await.nodes.len();
     loop {
-        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 3);
+        let nodes = routing_table.lock().await.get_closest_nodes(&node_id, 5);
         for node in nodes {
             let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
             
