@@ -354,6 +354,19 @@ impl RoutingTable {
         }
     }
 
+    //This is used to add nodes that we have heard about, but not heard from yet.
+    pub fn add_node_reference(&mut self, node_id: NodeId, addr: CompactAddress) {
+        //Only add this node if it's added to a bucket.
+        if self.buckets.add(node_id.clone()) {
+            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - (15*60);
+            if self.nodes_time.get_mut(&node_id).is_none()  { //Only add the time if it doesn't exist yet.
+                let time = (time, time);
+                self.nodes_time.insert(node_id.clone(), time);
+            }
+            self.nodes.insert(node_id.clone(), addr);
+        }
+    }
+
     pub fn get_node(&self, node_id: &NodeId) -> Option<&CompactAddress> {
         self.nodes.get(node_id)
     }

@@ -240,7 +240,7 @@ async fn main() -> io::Result<()> {
                                         trace!("get_peers response from {:?}. Nodes: {:?}", id, nodes);
                                         if nodes.is_some() {
                                             for node in nodes.unwrap().0 {
-                                                inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
+                                                inner_routing_table.lock().await.add_node_reference(node.id.clone(), node.addr.clone());
                                             }
                                         }
 
@@ -270,7 +270,7 @@ async fn main() -> io::Result<()> {
                                         //Add nodes to routing table
                                         trace!("find_node response from {:?}. Nodes: {:?}", id, nodes);
                                         for node in nodes.0 {
-                                            inner_routing_table.lock().await.add_node(node.id.clone(), node.addr.clone());
+                                            inner_routing_table.lock().await.add_node_reference(node.id.clone(), node.addr.clone());
                                         }
                                     }
                                     _ => {
