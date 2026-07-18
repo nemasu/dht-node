@@ -62,6 +62,7 @@ struct DhtContext {
     transaction_counter: Arc<Mutex<TransactionCounter>>,
     invalid_ping_response_version: Version,
     event_tx: mpsc::UnboundedSender<DhtEvent>,
+    bootstrap_nodes: Vec<SocketAddr>,
 }
 
 impl DhtContext {
@@ -251,6 +252,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                         //TODO check the transaction id
                         KRPCPayload::KRPCQueryIdResponse {id, p: _ } => { //P is this hosts port
                             let addr = CompactAddress::new_from_sockaddr(src);
+                            let mut suspicious = false;
 
                             {
                                 //Check if the node_id has changed
@@ -263,9 +265,14 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                             if msg.version.is_some() && msg.version.clone().unwrap() == ctx.invalid_ping_response_version {
                                                 debug!("Node with version {:?} is replying to pings with our node_id, ignoring.", msg.version.unwrap());
                                             } else {
-                                                error!("Node_id is being used by another node {:?}, exiting.", id);
-                                                std::process::exit(1);
+                                                //A real collision on the wider network. This node's own identity is
+                                                //compromised, but a caller may run many independent DhtNodes in one
+                                                //process - taking down every other one over a single collision would
+                                                //be a disproportionate blast radius, so just ignore this response
+                                                //instead of trusting/storing it.
+                                                error!("Node_id is being used by another node {:?} at {:?} - ignoring this response.", id, addr);
                                             }
+                                            suspicious = true;
                                         } else {
                                             debug!("Node {:?} has changed address from {:?} to {:?}, updating.", id, node_local, addr);
                                             rt.remove_node(&id);
@@ -273,8 +280,10 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                     }
                                 }
 
-                                //Add node to routing table
-                                rt.add_node(id.clone(), addr.clone());
+                                //Add node to routing table, unless this response claimed to be us.
+                                if !suspicious {
+                                    rt.add_node(id.clone(), addr.clone());
+                                }
                             }
 
                             //If this ping response was a result of a get_peers value check, add the node to the info_hash
@@ -393,7 +402,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
             }
         },
         Err(e) => {
-            warn!("Error decoding message: {:?}, message.", e);
+            debug!("Error decoding message: {:?}, message.", e);
             let error = KRPCMessage::error(203, "Protocol Error".to_string(), proto::TransactionId::new_from_i32(0));
             if let Err(e) = own.sock.send_to(&error.to_bencode().unwrap(), src).await {
                 warn!("Error sending error '{:?}' to: {:?}. Removing node.", e, src);
@@ -446,17 +455,28 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
     for stack in &stacks {
         if stack.table.lock().await.nodes.len() == 0 {
             let want_v4 = stack.sock.local_addr().map(|a| a.is_ipv4()).unwrap_or(true);
-            info!("No nodes in routing table, bootstrapping ({})", if want_v4 { "IPv4" } else { "IPv6" });
 
-            for hostname in BOOTSTRAP_HOSTS {
-                let addr = match resolve_hostname(hostname, want_v4).await {
-                    Some(a) => a,
-                    None => {
-                        warn!("Failed to resolve bootstrap hostname {:?} for this address family", hostname);
-                        continue;
+            let bootstrap_addrs: Vec<SocketAddr> = if !ctx.bootstrap_nodes.is_empty() {
+                ctx.bootstrap_nodes.iter().filter(|a| a.is_ipv4() == want_v4).copied().collect()
+            } else {
+                let mut addrs = Vec::new();
+                for hostname in BOOTSTRAP_HOSTS {
+                    match resolve_hostname(hostname, want_v4).await {
+                        Some(a) => addrs.push(a),
+                        None => warn!("Failed to resolve bootstrap hostname {:?} for this address family", hostname),
                     }
-                };
+                }
+                addrs
+            };
 
+            info!(
+                "No nodes in routing table, bootstrapping ({}) from {} address(es){}",
+                if want_v4 { "IPv4" } else { "IPv6" },
+                bootstrap_addrs.len(),
+                if ctx.bootstrap_nodes.is_empty() { " (public bootstrap hosts)" } else { " (provided)" }
+            );
+
+            for addr in bootstrap_addrs {
                 let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), Some(ctx.want_list()), transaction_counter.lock().await.get_transaction_id(CompactAddress::new_from_sockaddr(addr)));
                 if let Err(e) = stack.sock.send_to(&find_node.to_bencode().unwrap(), addr).await {
                     warn!("Error sending find_node: {:?} to {:?}.", e, addr);
@@ -580,8 +600,17 @@ pub struct DhtNodeConfig {
     pub bind_v4: Option<SocketAddr>,
     pub bind_v6: Option<SocketAddr>,
     pub node_id: Option<NodeId>,
-    pub rt_v4_path: String,
-    pub rt_v6_path: String,
+    //Persist this table's nodes to a file, reloaded on the next start with the same
+    //node_id. None disables persistence (e.g. short-lived nodes with a rotating node_id,
+    //where a saved table would never be reloaded anyway).
+    pub rt_v4_path: Option<String>,
+    pub rt_v6_path: Option<String>,
+    //Addresses to bootstrap from when the routing table is empty, instead of the public
+    //BOOTSTRAP_HOSTS. Empty (the default) means "use the public hosts," today's behavior.
+    //Useful for callers starting many nodes at once (e.g. a scanner) that want later nodes
+    //to bootstrap from already-known-good peers rather than repeatedly hitting shared
+    //public infrastructure.
+    pub bootstrap_nodes: Vec<SocketAddr>,
 }
 
 impl DhtNodeConfig {
@@ -590,8 +619,9 @@ impl DhtNodeConfig {
             bind_v4: None,
             bind_v6: None,
             node_id: None,
-            rt_v4_path: "rt-v4.json".to_string(),
-            rt_v6_path: "rt-v6.json".to_string(),
+            rt_v4_path: Some("rt-v4.json".to_string()),
+            rt_v6_path: Some("rt-v6.json".to_string()),
+            bootstrap_nodes: Vec::new(),
         }
     }
 }
@@ -607,6 +637,8 @@ impl Default for DhtNodeConfig {
 /// them is alive.
 pub struct DhtNode {
     pub node_id: NodeId,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    stacks: Vec<Stack>,
 }
 
 impl DhtNode {
@@ -626,7 +658,7 @@ impl DhtNode {
 
         let v4_stack = if let Some(addr) = config.bind_v4 {
             let sock = UdpSocket::bind(addr).await?;
-            let table = RoutingTable::load_or_new(Some(node_id.clone()), &config.rt_v4_path);
+            let table = RoutingTable::load_or_new(Some(node_id.clone()), config.rt_v4_path.as_deref());
             Some(Stack { sock: Arc::new(sock), table: Arc::new(Mutex::new(table)) })
         } else {
             None
@@ -635,7 +667,7 @@ impl DhtNode {
         let v6_stack = if let Some(addr) = config.bind_v6 {
             let std_sock = bind_v6_only(addr)?;
             let sock = UdpSocket::from_std(std_sock)?;
-            let table = RoutingTable::load_or_new(Some(node_id.clone()), &config.rt_v6_path);
+            let table = RoutingTable::load_or_new(Some(node_id.clone()), config.rt_v6_path.as_deref());
             Some(Stack { sock: Arc::new(sock), table: Arc::new(Mutex::new(table)) })
         } else {
             None
@@ -650,27 +682,50 @@ impl DhtNode {
             transaction_counter,
             invalid_ping_response_version,
             event_tx,
+            bootstrap_nodes: config.bootstrap_nodes,
         };
 
         let stacks: Vec<Stack> = ctx.v4.iter().chain(ctx.v6.iter()).cloned().collect();
 
+        let mut handles = Vec::with_capacity(stacks.len() + 1);
+
         for stack in &stacks {
             let stack = stack.clone();
             let ctx = ctx.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 receive_loop(stack, ctx).await;
-            });
+            }));
         }
 
         {
             let ctx = ctx.clone();
             let stacks = stacks.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 run_maintenance(ctx, stacks).await;
-            });
+            }));
         }
 
-        Ok((DhtNode { node_id }, event_rx))
+        Ok((DhtNode { node_id, handles, stacks }, event_rx))
+    }
+
+    /// Stop this node's background tasks and release its socket(s). The associated
+    /// `DhtEvent` receiver will stop yielding new events once this returns.
+    pub fn shutdown(self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+
+    /// Every peer address currently known across this node's active routing table(s).
+    /// Useful for seeding other `DhtNode`s' `bootstrap_nodes` from a real, already-running
+    /// node instead of the public bootstrap hosts.
+    pub async fn known_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for stack in &self.stacks {
+            let table = stack.table.lock().await;
+            addrs.extend(table.nodes.values().map(|addr| addr.socket_addr()));
+        }
+        addrs
     }
 }
 

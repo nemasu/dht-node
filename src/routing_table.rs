@@ -6,7 +6,7 @@ use crate::proto::{ByteArray, CompactAddress, CompactNode, CompactNodeList, Info
 
 use crate::bucket::Buckets;
 
-use log::{debug, error, trace, warn};
+use log::{debug, trace, warn};
 
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
@@ -14,8 +14,10 @@ pub struct RoutingTable {
     //This clients node_id
     pub node_id: NodeId,
 
-    //Path this table is persisted to/loaded from (kept separate per address family)
-    pub path: String,
+    //Path this table is persisted to/loaded from (kept separate per address family).
+    //None disables persistence entirely (e.g. short-lived nodes with rotating node_ids,
+    //where a saved table would never be reloaded under the same id anyway).
+    pub path: Option<String>,
 
     //Buckets
     pub buckets: Buckets,
@@ -51,10 +53,10 @@ pub struct RoutingTable {
 
 impl RoutingTable {
 
-    pub fn new(node_id: &NodeId, path: &str) -> Self {
+    pub fn new(node_id: &NodeId, path: Option<&str>) -> Self {
         RoutingTable {
             node_id: node_id.clone(),
-            path: path.to_string(),
+            path: path.map(|p| p.to_string()),
             nodes: HashMap::new(),
             info_hashes: HashMap::new(),
             tokens: HashMap::new(),
@@ -95,8 +97,13 @@ impl RoutingTable {
         }
     }
 
-    //Save the routing table to a file
+    //Save the routing table to a file, if persistence is enabled for this table.
     pub fn save(&self) {
+
+        let path = match &self.path {
+            Some(path) => path,
+            None => return,
+        };
 
         let mut data = json::object!{
             nodes: {},
@@ -105,7 +112,7 @@ impl RoutingTable {
         //Nodes
         for (node_id, addr) in &self.nodes {
             let addr_hex = hex::encode(addr.to_bytes());
-            
+
             data["nodes"][node_id.to_hex()] = json::object!{
                 "addr": addr_hex,
             };
@@ -113,11 +120,12 @@ impl RoutingTable {
 
         //node_id, info_hashes, node_times, tokens and sent_tokens are not saved
 
-        std::fs::write(&self.path, data.dump()).unwrap();
+        std::fs::write(path, data.dump()).unwrap();
     }
 
-    //Load the routing table from a file
-    pub fn load_or_new(cmdline_node_id: Option<NodeId>, path: &str) -> Self {
+    //Load the routing table from a file, or start a fresh one if persistence is disabled
+    //(path is None) or no file exists yet at path.
+    pub fn load_or_new(cmdline_node_id: Option<NodeId>, path: Option<&str>) -> Self {
 
         let node_id: Option<NodeId>;
         if let Some(id) = cmdline_node_id {
@@ -128,7 +136,9 @@ impl RoutingTable {
         }
 
         //Check if the file exists located at path
-        if Path::new(path).exists() {
+        if path.is_some_and(|p| Path::new(p).exists()) {
+            let path = path.unwrap();
+
             //Load the file
             let data = json::parse(std::fs::read_to_string(path).unwrap().as_str()).unwrap();
 
@@ -136,7 +146,7 @@ impl RoutingTable {
             let node_id = node_id.unwrap();
             let mut routing_table = RoutingTable {
                 node_id: node_id.clone(),
-                path: path.to_string(),
+                path: Some(path.to_string()),
                 nodes: HashMap::new(),
                 info_hashes: HashMap::new(),
                 tokens: HashMap::new(),
@@ -471,9 +481,13 @@ impl TransactionCounter {
     }
 
     pub fn get_addr_for_tranaction_id(&self, id: TransactionId) -> Option<&CompactAddress> {
+        //Reachable from network input (a peer's "e" error message can carry an arbitrary
+        //transaction id) - decline rather than take down every other node sharing this
+        //process over one malformed packet. The caller already treats None as "unknown
+        //transaction, nothing to do."
         if id.0.len() != 4 {
-            error!("TransactionId is not 4 bytes long");
-            std::process::exit(1);
+            warn!("TransactionId is not 4 bytes long, ignoring.");
+            return None;
         }
 
         //Convert id to i32 and get the address from the map
@@ -515,7 +529,7 @@ mod tests {
     #[test]
     fn test_routing_table() {
         let node_id = NodeId::generate_nodeid();
-        let mut routing_table = RoutingTable::new(&node_id, "rt-test.json");
+        let mut routing_table = RoutingTable::new(&node_id, Some("rt-test.json"));
 
         let addr: SocketAddrV4 = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080);
         let compact_addr = CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(addr));

@@ -87,68 +87,69 @@ impl ByteArray {
         (ByteArray::new(result), remainder)
     }
 
+    /// Fixed-width (mod 2^(8*len)) increment: the result is always exactly `a.0.len()`
+    /// bytes, wrapping around on overflow rather than growing - callers rely on
+    /// NodeId/InfoHash-shaped values always staying the same length (bucket ranges,
+    /// PartialOrd, etc. all assume a fixed width).
     pub fn add_one(a: &ByteArray) -> ByteArray {
         let mut result = Vec::with_capacity(a.0.len());
         let mut carry = 1;
-    
+
         for &byte in a.0.iter().rev() {
             let (new_byte, new_carry) = byte.overflowing_add(carry);
             carry = if new_carry { 1 } else { 0 };
             result.push(new_byte);
         }
-    
-        if carry == 1 {
-            result.push(1);
-        }
-    
+        // Any carry out of the most significant byte wraps around rather than growing
+        // the array, matching normal fixed-width unsigned overflow.
+
         result.reverse();
         ByteArray::new(result)
     }
 
+    /// Fixed-width (mod 2^(8*max(a.len(), b.len()))) addition - see `add_one` for why the
+    /// result must never grow beyond the operands' length.
     pub fn add(a: &ByteArray, b: &ByteArray) -> ByteArray {
         let max_len = std::cmp::max(a.0.len(), b.0.len());
-        let mut result = Vec::with_capacity(max_len + 1);
+        let mut result = Vec::with_capacity(max_len);
         let mut carry = 0;
-    
+
         for i in 0..max_len {
             let byte_a = a.0.get(a.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
             let byte_b = b.0.get(b.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
-    
+
             let (new_byte, carry1) = byte_a.overflowing_add(byte_b);
             let (new_byte, carry2) = new_byte.overflowing_add(carry);
             carry = (carry1 as u8) + (carry2 as u8);
-    
+
             result.push(new_byte);
         }
-    
-        if carry > 0 {
-            result.push(carry);
-        }
-    
+        // Any carry out of the most significant byte wraps around rather than growing
+        // the array, matching normal fixed-width unsigned overflow.
+
         result.reverse();
         ByteArray::new(result)
     }
 
+    /// Fixed-width (mod 2^(8*max(a.len(), b.len()))) subtraction - the result keeps
+    /// leading zero bytes rather than trimming them, so it's always the same length as
+    /// the operands (see `add_one` for why that matters).
     pub fn subtract(a: &ByteArray, b: &ByteArray) -> ByteArray {
         let max_len = std::cmp::max(a.0.len(), b.0.len());
         let mut result = Vec::with_capacity(max_len);
         let mut borrow = 0;
-    
+
         for i in 0..max_len {
             let byte_a = a.0.get(a.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
             let byte_b = b.0.get(b.0.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(0);
-    
-            let (new_byte, borrow1) = byte_a.overflowing_sub(byte_b + borrow);
-            borrow = if borrow1 { 1 } else { 0 };
-    
+
+            let (byte_b_plus_borrow, add_overflowed) = byte_b.overflowing_add(borrow);
+            let (new_byte, sub_overflowed) = byte_a.overflowing_sub(byte_b_plus_borrow);
+            borrow = if add_overflowed || sub_overflowed { 1 } else { 0 };
+
             result.push(new_byte);
         }
-    
-        // Remove leading zeros from the result
-        while result.len() > 1 && result.last() == Some(&0) {
-            result.pop();
-        }
-    
+
         result.reverse();
         ByteArray::new(result)
     }
@@ -1333,6 +1334,19 @@ mod tests {
     }
 
     #[test]
+    fn test_bytearray_subtract_borrow_chain_does_not_overflow() {
+        //Regression test: subtracting a byte of 0xFF at a position where the incoming
+        //borrow is already 1 used to panic with "attempt to add with overflow" (0xFF + 1
+        //overflows u8) instead of correctly propagating the borrow.
+        let a = ByteArray::from_hex("01 FF 00");
+        let b = ByteArray::from_hex("00 FF 01");
+        let result = ByteArray::subtract(&a, &b);
+        //Leading zero bytes are kept, not trimmed - the result must stay the same length
+        //as the operands (see test_bytearray_arithmetic_preserves_length for why).
+        assert_eq!(result, ByteArray::from_hex("00 FF FF"));
+    }
+
+    #[test]
     fn test_bytearray_add_one() {
         let a = ByteArray::new_from_i32(10000);
         let b = ByteArray::add_one(&a);
@@ -1341,5 +1355,29 @@ mod tests {
         let a = ByteArray::from_hex("57 9c bf d0 cd 1b 56 ff ff");
         let b = ByteArray::add_one(&a);
         assert_eq!(b, ByteArray::from_hex("57 9c bf d0 cd 1b 57 00 00"));
+    }
+
+    #[test]
+    fn test_bytearray_arithmetic_preserves_length() {
+        //Regression test: add/add_one/subtract used to grow the result on overflow (add,
+        //add_one) or trim leading zero bytes (subtract), producing a ByteArray with a
+        //different length than its 20-byte NodeId inputs. Since PartialOrd for ByteArray
+        //compares length before value (proto.rs), a stray length change silently breaks
+        //numeric ordering - which is exactly what corrupted DHT bucket splitting
+        //(bucket.rs) under real load: a computed bucket boundary ended up 21 bytes instead
+        //of 20, comparing as "greater than" values it was numerically smaller than.
+        let max = ByteArray::from_hex("ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff");
+        let one = ByteArray::add_one(&max);
+        assert_eq!(one.0.len(), 20, "add_one must not grow on overflow");
+        assert_eq!(one, ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"));
+
+        let sum = ByteArray::add(&max, &ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01"));
+        assert_eq!(sum.0.len(), 20, "add must not grow on overflow");
+        assert_eq!(sum, ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"));
+
+        let min = ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01");
+        let diff = ByteArray::subtract(&min, &ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01"));
+        assert_eq!(diff.0.len(), 20, "subtract must not trim leading zero bytes");
+        assert_eq!(diff, ByteArray::from_hex("00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"));
     }
 }

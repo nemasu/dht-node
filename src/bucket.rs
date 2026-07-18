@@ -59,9 +59,11 @@ impl Buckets {
         }
 
         if bucket_to_change.is_none() {
-            error!("Buckets: {:?}, Node: {:?}", self.buckets, node_id);
-            error!("Bucket not found!");
-            std::process::exit(1);
+            //Should never happen (buckets always cover the full keyspace), but decline
+            //rather than take down every other node sharing this process - nothing has
+            //been mutated yet at this point, so it's safe to just refuse this node.
+            error!("Bucket not found for node {:?}. Buckets: {:?}", node_id, self.buckets);
+            return false;
         }
 
         let to_change = BucketNode::new_for_remove(bucket_to_change.unwrap());
@@ -129,11 +131,14 @@ impl Buckets {
                 }
 
                 if new_one.max <= new_one.min || new_two.max <= new_two.min {
-                    error!("bucket {:?}", bucket);
-                    error!("bucket range error! new_one: {:?}", new_one);
-                    error!("bucket range error! new_two: {:?}", new_two);
-                    error!("bucket range error!");
-                    std::process::exit(1);
+                    //Should never happen (bucket ranges are supposed to always be wide
+                    //enough to split), but a single corrupted bucket must not take down
+                    //every other node sharing this process (a caller may run many DhtNodes
+                    //in one process) - decline the split/add and leave the original bucket
+                    //in place, same as the "bucket full" case above.
+                    error!("bucket range error splitting {:?}: new_one {:?}, new_two {:?}", bucket, new_one, new_two);
+                    self.buckets.insert(bucket);
+                    return false;
                 }
 
                 self.buckets.insert(new_one);
