@@ -1,11 +1,11 @@
 use bendy::encoding::{Error, SingleItemEncoder, ToBencode};
 use bendy::decoding::FromBencode;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddrV4, SocketAddrV6};
 use byteorder::{
     NetworkEndian,
     WriteBytesExt,
 };
-use rand::Rng;
+use rand::RngExt;
 use core::fmt;
 
 use log::{trace, warn};
@@ -19,7 +19,7 @@ impl ByteArray {
     }
 
     pub fn generate(length: usize) -> ByteArray {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut id_bytes = vec![0u8; length];
         rng.fill(&mut id_bytes[..]);
 
@@ -27,11 +27,11 @@ impl ByteArray {
     }
 
     pub fn generate_range(min: ByteArray, max: ByteArray) -> ByteArray {
-        let mut rng = rand::thread_rng();
-        
+        let mut rng = rand::rng();
+
         let mut difference = ByteArray::subtract(&max, &min);
         for byte in &mut difference.0 {
-            *byte = rng.gen_range(0..=*byte); 
+            *byte = rng.random_range(0..=*byte);
         }
 
         let ret = ByteArray::add(&min, &difference);
@@ -216,47 +216,94 @@ pub type Token = ByteArray;
 
 pub type CompactIp = ByteArray;
 
-#[derive(PartialEq, Eq, Hash)]
-pub struct CompactAddress {
-    pub addr: SocketAddrV4,
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub enum CompactAddress {
+    V4(SocketAddrV4),
+    V6(SocketAddrV6),
 }
 impl CompactAddress {
 
     pub fn new_from_sockaddr(addr: std::net::SocketAddr) -> Self {
-        let addr = match addr {
-            std::net::SocketAddr::V4(addr_v4) => addr_v4,
-            std::net::SocketAddr::V6(_) => panic!("Expected SocketAddrV4, found SocketAddrV6"),
-        };
-        CompactAddress { addr }
+        match addr {
+            std::net::SocketAddr::V4(addr_v4) => CompactAddress::V4(addr_v4),
+            std::net::SocketAddr::V6(addr_v6) => CompactAddress::V6(addr_v6),
+        }
     }
 
+    /// Decode from the "Compact IP-address/port info" format. The address
+    /// family is determined by length: 6 bytes (4-byte IP + 2-byte port)
+    /// for IPv4, 18 bytes (16-byte IP + 2-byte port) for IPv6.
     pub fn new(bytes: Vec<u8>) -> Self {
-        let addr = SocketAddrV4::new(
-            std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]),
-            <NetworkEndian as byteorder::ByteOrder>::read_u16(&bytes[4..]),
-        );
+        match bytes.len() {
+            6 => {
+                let addr = SocketAddrV4::new(
+                    std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]),
+                    <NetworkEndian as byteorder::ByteOrder>::read_u16(&bytes[4..6]),
+                );
+                CompactAddress::V4(addr)
+            }
+            18 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&bytes[0..16]);
+                let ip = std::net::Ipv6Addr::from(octets);
+                let port = <NetworkEndian as byteorder::ByteOrder>::read_u16(&bytes[16..18]);
 
-        CompactAddress { addr }
+                //An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is really an IPv4 address
+                //smuggled into a 16-byte field; treat it as V4 so it's routed to (and
+                //sent over) the IPv4 stack instead of a v6-only socket, which will
+                //refuse to send to it.
+                match ip.to_ipv4_mapped() {
+                    Some(ipv4) => CompactAddress::V4(SocketAddrV4::new(ipv4, port)),
+                    None => CompactAddress::V6(SocketAddrV6::new(ip, port, 0, 0)),
+                }
+            }
+            n => panic!("CompactAddress: unexpected byte length {} (expected 6 or 18)", n),
+        }
+    }
+
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        match self {
+            CompactAddress::V4(addr) => std::net::SocketAddr::V4(*addr),
+            CompactAddress::V6(addr) => std::net::SocketAddr::V6(*addr),
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            CompactAddress::V4(addr) => addr.port(),
+            CompactAddress::V6(addr) => addr.port(),
+        }
+    }
+
+    pub fn is_v4(&self) -> bool {
+        matches!(self, CompactAddress::V4(_))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_v6(&self) -> bool {
+        matches!(self, CompactAddress::V6(_))
     }
 
     /// Encode with the "Compact IP-address/port info" format
-    pub fn to_bytes(&self) -> [u8; 6] {
-        let mut raw = [0u8; 6];
-        
-        let ip = self.addr.ip();
-        let port = self.addr.port();
-
-        raw[..4].clone_from_slice(&ip.octets());
-        (&mut raw[4..])
-            .write_u16::<NetworkEndian>(port)
-            .expect("Failed to encode port.");
-
-        raw
-    }
-}
-impl Clone for CompactAddress {
-    fn clone(&self) -> Self {
-        CompactAddress { addr: self.addr.clone() }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            CompactAddress::V4(addr) => {
+                let mut raw = vec![0u8; 6];
+                raw[..4].clone_from_slice(&addr.ip().octets());
+                (&mut raw[4..6])
+                    .write_u16::<NetworkEndian>(addr.port())
+                    .expect("Failed to encode port.");
+                raw
+            }
+            CompactAddress::V6(addr) => {
+                let mut raw = vec![0u8; 18];
+                raw[..16].clone_from_slice(&addr.ip().octets());
+                (&mut raw[16..18])
+                    .write_u16::<NetworkEndian>(addr.port())
+                    .expect("Failed to encode port.");
+                raw
+            }
+        }
     }
 }
 impl ToBencode for CompactAddress {
@@ -269,7 +316,10 @@ impl ToBencode for CompactAddress {
 impl FromBencode for CompactAddress {
     fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
         let bytes = object.try_into_bytes()?;
-        Ok(CompactAddress::new(bytes.to_vec()))
+        match bytes.len() {
+            6 | 18 => Ok(CompactAddress::new(bytes.to_vec())),
+            n => Err(bendy::decoding::Error::unexpected_field(format!("CompactAddress: unexpected byte length {} (expected 6 or 18)", n))),
+        }
     }
 }
 impl fmt::Display for CompactAddress {
@@ -279,7 +329,10 @@ impl fmt::Display for CompactAddress {
 }
 impl fmt::Debug for CompactAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.addr)
+        match self {
+            CompactAddress::V4(addr) => write!(f, "{:?}", addr),
+            CompactAddress::V6(addr) => write!(f, "{:?}", addr),
+        }
     }
 }
 
@@ -288,6 +341,52 @@ pub struct CompactNodeList(pub Vec<CompactNode>);
 impl CompactNodeList {
     pub fn new_from_vec(nodes: Vec<CompactNode>) -> Self {
         CompactNodeList(nodes)
+    }
+
+    /// Decode a "nodes" field: a blob of concatenated 26-byte entries
+    /// (20-byte node id + 6-byte compact IPv4 address/port).
+    pub fn decode_v4(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
+        Self::decode_with_addr_len(object, 6)
+    }
+
+    /// Decode a "nodes6" field: a blob of concatenated 38-byte entries
+    /// (20-byte node id + 18-byte compact IPv6 address/port).
+    pub fn decode_v6(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
+        Self::decode_with_addr_len(object, 18)
+    }
+
+    fn decode_with_addr_len(object: bendy::decoding::Object, addr_len: usize) -> Result<Self, bendy::decoding::Error> {
+        let mut nodes = Vec::new();
+
+        let bytes = object.try_into_bytes()?;
+        let mut bytes = bytes.to_vec();
+
+        let entry_len = 20 + addr_len;
+
+        if bytes.len() < entry_len {
+            return Err(bendy::decoding::Error::unexpected_field("CompactNodeList is empty/too short."));
+        }
+
+        loop {
+            let node_bytes = bytes.drain(0..20).collect();
+            let addr_bytes = bytes.drain(0..addr_len).collect();
+
+            let id = NodeId::new(node_bytes);
+            let addr = CompactAddress::new(addr_bytes);
+
+            nodes.push(CompactNode { id, addr });
+
+            if bytes.is_empty() || bytes.len() < entry_len {
+
+                if bytes.len() > 0 {
+                    warn!("CompactNodeList too short");
+                }
+
+                break;
+            }
+        }
+
+        Ok(CompactNodeList(nodes))
     }
 }
 impl ToBencode for CompactNodeList {
@@ -312,39 +411,6 @@ impl Clone for CompactNodeList {
     
             CompactNodeList(nodes)
         }
-}
-impl FromBencode for CompactNodeList {
-    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, bendy::decoding::Error> {
-        let mut nodes = Vec::new();
-
-        let bytes = object.try_into_bytes()?;
-        let mut bytes = bytes.to_vec();
-
-        if bytes.len() < 26 {
-            return Err(bendy::decoding::Error::unexpected_field("CompactNodeList is empty/too short."));
-        }
-
-        loop {
-            let node_bytes = bytes.drain(0..20).collect();
-            let addr_bytes = bytes.drain(0..6).collect();
-
-            let id = NodeId::new(node_bytes);
-            let addr = CompactAddress::new(addr_bytes);
-
-            nodes.push(CompactNode { id, addr });
-
-            if bytes.is_empty() || bytes.len() < 26 {
-
-                if bytes.len() > 0 {
-                    warn!("CompactNodeList too short");
-                }
-                
-                break;
-            }
-        }
-
-        Ok(CompactNodeList(nodes))
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -460,11 +526,12 @@ impl KRPCMessage {
         }
     }
 
-    pub fn find_node(node_id: NodeId, target: NodeId, transaction_id: TransactionId) -> Self {
+    pub fn find_node(node_id: NodeId, target: NodeId, want: Option<Vec<String>>, transaction_id: TransactionId) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryFindNodeRequest {
                 id: node_id,
                 target: target,
+                want: want,
             },
             transaction_id: transaction_id,
             message_type: "q".to_string(),
@@ -474,12 +541,13 @@ impl KRPCMessage {
         }
     }
 
-    pub fn find_node_response(node_id: NodeId, nodes: CompactNodeList, transaction_id: TransactionId, target_addr: CompactAddress) -> Self {
+    pub fn find_node_response(node_id: NodeId, nodes: Option<CompactNodeList>, nodes6: Option<CompactNodeList>, transaction_id: TransactionId, target_addr: CompactAddress) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryFindNodeResponse {
                 id: node_id,
                 nodes: nodes,
-                p: Some(target_addr.addr.port() as u32),
+                nodes6: nodes6,
+                p: Some(target_addr.port() as u32),
             },
             transaction_id: transaction_id,
             message_type: "r".to_string(),
@@ -513,7 +581,7 @@ impl KRPCMessage {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryIdResponse {
                 id: node_id,
-                p: Some(target_addr.addr.port() as u32),
+                p: Some(target_addr.port() as u32),
             },
             transaction_id: transaction_id,
             message_type: "r".to_string(),
@@ -523,11 +591,12 @@ impl KRPCMessage {
         }
     }
 
-    pub fn get_peers(node_id: NodeId, info_hash: InfoHash, transaction_id: TransactionId) -> Self {
+    pub fn get_peers(node_id: NodeId, info_hash: InfoHash, want: Option<Vec<String>>, transaction_id: TransactionId) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryGetPeersRequest {
                 id: node_id,
                 info_hash: info_hash,
+                want: want,
             },
             transaction_id: transaction_id.clone(),
             message_type: "q".to_string(),
@@ -537,14 +606,16 @@ impl KRPCMessage {
         }
     }
 
-    pub fn get_peers_response(node_id: NodeId, token: Token, nodes: CompactNodeList, transaction_id: TransactionId, values: Option<Vec<CompactAddress>>, target_addr: CompactAddress) -> Self {
+    pub fn get_peers_response(node_id: NodeId, token: Token, nodes: Option<CompactNodeList>, nodes6: Option<CompactNodeList>, values: Option<Vec<CompactAddress>>, values6: Option<Vec<CompactAddress>>, transaction_id: TransactionId, target_addr: CompactAddress) -> Self {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryGetPeersResponse {
                 id: node_id,
                 token: token,
-                nodes: Some(nodes),
+                nodes: nodes,
+                nodes6: nodes6,
                 values: values,
-                p: Some(target_addr.addr.port() as u32),
+                values6: values6,
+                p: Some(target_addr.port() as u32),
             },
             transaction_id: transaction_id.clone(),
             message_type: "r".to_string(),
@@ -571,7 +642,7 @@ impl KRPCMessage {
         KRPCMessage {
             payload: KRPCPayload::KRPCQueryIdResponse {
                 id: node_id,
-                p: Some(target_addr.addr.port() as u32),
+                p: Some(target_addr.port() as u32),
             },
             transaction_id: transaction_id.clone(),
             message_type: "r".to_string(),
@@ -591,32 +662,32 @@ impl ToBencode for KRPCMessage {
             e.emit_pair(b"y", &self.message_type)?;
 
             match &self.payload {
-                KRPCPayload::KRPCQueryPingRequest { id: _ } => {
+                KRPCPayload::KRPCQueryPingRequest { .. } => {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryIdResponse { id: _, p: _ } => {
+                KRPCPayload::KRPCQueryIdResponse { .. } => {
                     e.emit_pair(b"r", &self.payload)?;
                 },
                 KRPCPayload::KRPCError(error) => {
                     e.emit_pair(b"e", error)?;
                 },
-                KRPCPayload::KRPCQueryGetPeersRequest { id: _, info_hash: _ } => {
+                KRPCPayload::KRPCQueryGetPeersRequest { .. } => {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryGetPeersResponse { id: _, token: _, nodes: _ , values: _, p: _ } => {
+                KRPCPayload::KRPCQueryGetPeersResponse { .. } => {
                     e.emit_pair(b"r", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryAnnouncePeerRequest { id: _, info_hash: _, token: _, port: _, implied_port: _, seed: _ } => {
+                KRPCPayload::KRPCQueryAnnouncePeerRequest { .. } => {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryFindNodeRequest { id: _, target: _ } => {
+                KRPCPayload::KRPCQueryFindNodeRequest { .. } => {
                     e.emit_pair(b"q", self.query.clone().unwrap())?;
                     e.emit_pair(b"a", &self.payload)?;
                 },
-                KRPCPayload::KRPCQueryFindNodeResponse { id: _, nodes: _, p: _ } => {
+                KRPCPayload::KRPCQueryFindNodeResponse { .. } => {
                     e.emit_pair(b"r", &self.payload)?;
                 },
             }
@@ -661,14 +732,15 @@ impl FromBencode for KRPCMessage {
 
                     let mut id = None;
                     let mut info_hash = None;
-                    
+
                     let mut token = None;
                     let mut port = None;
                     let mut implied_port = None;
                     let mut seed = None;
 
                     let mut target = None;
-                   
+                    let mut want = None;
+
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
                             (b"id", value) => {
@@ -692,23 +764,29 @@ impl FromBencode for KRPCMessage {
                             (b"target", value) => {
                                 target = NodeId::decode_bencode_object(value).ok();
                             },
-                            //TODO add more potential request fields here
-                            (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
+                            (b"want", value) => {
+                                want = Vec::<String>::decode_bencode_object(value).ok();
+                            },
+                            //Unknown/extension fields (e.g. "noseed") are ignored rather than
+                            //failing the whole message, matching real-world client behavior.
+                            (key, _) => {
+                                trace!("Ignoring unrecognized query argument: {:?}", String::from_utf8_lossy(key));
+                            },
                         }
                     }
 
                     //We determine the payload type based off the arguments present.
-                    //Other libraries do this too using #[serde(untagged)] 
-                    if id.is_some() && info_hash.is_some() && token.is_some() {
+                    //Other libraries do this too using #[serde(untagged)]
+                    if id.is_some() && info_hash.is_some() && token.is_some() && port.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryAnnouncePeerRequest { id: id.unwrap(), info_hash: info_hash.unwrap(), token: token.unwrap(), port: port.unwrap(), implied_port, seed});
                     } else if id.is_some() && target.is_some() {
-                        payload = Some(KRPCPayload::KRPCQueryFindNodeRequest { id: id.unwrap(), target: target.unwrap() });
+                        payload = Some(KRPCPayload::KRPCQueryFindNodeRequest { id: id.unwrap(), target: target.unwrap(), want });
                     } else if info_hash.is_some() && id.is_some() {
-                        payload = Some(KRPCPayload::KRPCQueryGetPeersRequest { id: id.unwrap(), info_hash: info_hash.unwrap() });
+                        payload = Some(KRPCPayload::KRPCQueryGetPeersRequest { id: id.unwrap(), info_hash: info_hash.unwrap(), want });
                     } else if id.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryPingRequest { id: id.unwrap() });
                     }
-                    
+
                 },
                 (b"r", value) => {  
                     let mut dict = value.try_into_dictionary()?;
@@ -717,7 +795,9 @@ impl FromBencode for KRPCMessage {
                     let mut port = None;
                     let mut token = None;
                     let mut nodes = None;
+                    let mut nodes6 = None;
                     let mut values = None;
+                    let mut values6 = None;
 
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
@@ -731,27 +811,37 @@ impl FromBencode for KRPCMessage {
                                 token = Token::decode_bencode_object(value).ok();
                             },
                             (b"nodes", value) => {
-                                nodes = CompactNodeList::decode_bencode_object(value).ok();
+                                nodes = CompactNodeList::decode_v4(value).ok();
+                            },
+                            (b"nodes6", value) => {
+                                nodes6 = CompactNodeList::decode_v6(value).ok();
                             },
                             (b"values", value) => {
-                                values = Vec::<CompactAddress>::decode_bencode_object(value).unwrap().into();
+                                values = Vec::<CompactAddress>::decode_bencode_object(value).ok();
+                            }
+                            (b"values6", value) => {
+                                values6 = Vec::<CompactAddress>::decode_bencode_object(value).ok();
                             }
                             (b"ip", value) => {
-                                let ip: CompactIp = CompactIp::decode_bencode_object(value).unwrap().into();
-                                let ip = std::net::Ipv4Addr::new(ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
-                                trace!("Received IP in response: {}", ip);
+                                if let Some(ip) = CompactIp::decode_bencode_object(value).ok() {
+                                    if matches!(ip.0.len(), 6 | 18) {
+                                        trace!("Received IP in response: {:?}", CompactAddress::new(ip.0));
+                                    }
+                                }
                             }
-                            //TODO add more potential response fields here
-                            (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
+                            //Unknown/extension fields are ignored rather than failing the whole message.
+                            (key, _) => {
+                                trace!("Ignoring unrecognized response field: {:?}", String::from_utf8_lossy(key));
+                            },
                         }
                     }
 
                     //We determine the payload type based off the arguments present.
                     //Other libraries do this too using #[serde(untagged)]
-                    if id.is_some() && token.is_some() && (nodes.is_some() || values.is_some()) {
-                        payload = Some(KRPCPayload::KRPCQueryGetPeersResponse { id: id.unwrap(), token: token.unwrap(), nodes: nodes, values: values, p: port });
-                    } else if id.is_some() && nodes.is_some() {
-                        payload = Some(KRPCPayload::KRPCQueryFindNodeResponse { id: id.unwrap(), nodes: nodes.unwrap(), p: port });
+                    if id.is_some() && token.is_some() && (nodes.is_some() || nodes6.is_some() || values.is_some() || values6.is_some()) {
+                        payload = Some(KRPCPayload::KRPCQueryGetPeersResponse { id: id.unwrap(), token: token.unwrap(), nodes, nodes6, values, values6, p: port });
+                    } else if id.is_some() && (nodes.is_some() || nodes6.is_some()) {
+                        payload = Some(KRPCPayload::KRPCQueryFindNodeResponse { id: id.unwrap(), nodes, nodes6, p: port });
                     } else if id.is_some() {
                         payload = Some(KRPCPayload::KRPCQueryIdResponse { id: id.unwrap(), p: port });
                     }
@@ -766,7 +856,10 @@ impl FromBencode for KRPCMessage {
                 (b"v", value) => {
                     version = Version::decode_bencode_object(value).ok();
                 },
-                (key, _) => return Err(bendy::decoding::Error::unexpected_field(String::from_utf8_lossy(key).to_string())),
+                //Unknown/extension top-level fields are ignored rather than failing the whole message.
+                (key, _) => {
+                    trace!("Ignoring unrecognized top-level field: {:?}", String::from_utf8_lossy(key));
+                },
             }
         }
 
@@ -792,12 +885,15 @@ pub enum KRPCPayload {
     KRPCQueryGetPeersRequest {
         id: NodeId,
         info_hash: InfoHash,
+        want: Option<Vec<String>>, //BEP32: ["n4"], ["n6"], or both
     },
     KRPCQueryGetPeersResponse {
         id: NodeId,
         token: ByteArray,
         nodes: Option<CompactNodeList>,
+        nodes6: Option<CompactNodeList>,
         values: Option<Vec<CompactAddress>>, //Why this is a list and nodes isn't is a mystery.
+        values6: Option<Vec<CompactAddress>>,
         p: Option<u32>, //The port of the requestor
     },
 
@@ -813,10 +909,12 @@ pub enum KRPCPayload {
     KRPCQueryFindNodeRequest {
         id: NodeId,
         target: NodeId,
+        want: Option<Vec<String>>, //BEP32: ["n4"], ["n6"], or both
     },
     KRPCQueryFindNodeResponse {
         id: NodeId,
-        nodes: CompactNodeList,
+        nodes: Option<CompactNodeList>,
+        nodes6: Option<CompactNodeList>,
         p: Option<u32>, //The port of the requestor
     },
 
@@ -852,24 +950,38 @@ impl ToBencode for KRPCPayload {
                     Ok(())
                 })
             },
-            KRPCPayload::KRPCQueryGetPeersRequest { id, info_hash } => {
+            KRPCPayload::KRPCQueryGetPeersRequest { id, info_hash, want } => {
                 encoder.emit_unsorted_dict(|e| {
                     e.emit_pair(b"id", id)?;
                     e.emit_pair(b"info_hash", info_hash)?;
 
+                    if let Some(want) = want {
+                        if !want.is_empty() {
+                            e.emit_pair(b"want", want)?;
+                        }
+                    }
+
                     Ok(())
                 })
             },
-            KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, values, p } => {
+            KRPCPayload::KRPCQueryGetPeersResponse { id, token, nodes, nodes6, values, values6, p } => {
                 encoder.emit_unsorted_dict(|e| {
                     e.emit_pair(b"id", id)?;
                     e.emit_pair(b"token", token)?;
                     if let Some(nodes) = nodes {
                         e.emit_pair(b"nodes", nodes.clone())?;
                     }
-                    
+
+                    if let Some(nodes6) = nodes6 {
+                        e.emit_pair(b"nodes6", nodes6.clone())?;
+                    }
+
                     if let Some(values) = values {
                         e.emit_pair(b"values", values.clone())?;
+                    }
+
+                    if let Some(values6) = values6 {
+                        e.emit_pair(b"values6", values6.clone())?;
                     }
 
                     if let Some(p) = p {
@@ -897,18 +1009,31 @@ impl ToBencode for KRPCPayload {
                     Ok(())
                 })
             },
-            KRPCPayload::KRPCQueryFindNodeRequest { id, target } => {
+            KRPCPayload::KRPCQueryFindNodeRequest { id, target, want } => {
                 encoder.emit_unsorted_dict(|e| {
                     e.emit_pair(b"id", id)?;
                     e.emit_pair(b"target", target)?;
 
+                    if let Some(want) = want {
+                        if !want.is_empty() {
+                            e.emit_pair(b"want", want)?;
+                        }
+                    }
+
                     Ok(())
                 })
             },
-            KRPCPayload::KRPCQueryFindNodeResponse { id, nodes, p } => {
+            KRPCPayload::KRPCQueryFindNodeResponse { id, nodes, nodes6, p } => {
                 encoder.emit_unsorted_dict(|e| {
                     e.emit_pair(b"id", id)?;
-                    e.emit_pair(b"nodes", nodes)?;
+
+                    if let Some(nodes) = nodes {
+                        e.emit_pair(b"nodes", nodes)?;
+                    }
+
+                    if let Some(nodes6) = nodes6 {
+                        e.emit_pair(b"nodes6", nodes6)?;
+                    }
 
                     if let Some(p) = p {
                         e.emit_pair(b"p", p)?;
@@ -968,7 +1093,7 @@ mod tests {
 
     #[test]
     fn test_query_get_peers() {
-        let get_peers = KRPCMessage::get_peers(NodeId::generate_nodeid(), InfoHash::generate(20), TransactionId::generate(4));
+        let get_peers = KRPCMessage::get_peers(NodeId::generate_nodeid(), InfoHash::generate(20), None, TransactionId::generate(4));
 
         let vecs = get_peers.to_bencode().unwrap();
 
@@ -1016,9 +1141,7 @@ mod tests {
 
     #[test]
     fn test_address() {
-        let addr = CompactAddress {
-            addr: SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080),
-        };
+        let addr = CompactAddress::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080));
 
         let vecs = addr.to_bencode().unwrap();
         let decoded = CompactAddress::from_bencode(&vecs).unwrap();
@@ -1026,6 +1149,117 @@ mod tests {
         println!("{:?}", decoded);
 
         assert_eq!(addr, decoded);
+    }
+
+    #[test]
+    fn test_address_v6() {
+        let addr = CompactAddress::V6(SocketAddrV6::new(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 6881, 0, 0));
+
+        let vecs = addr.to_bencode().unwrap();
+        assert_eq!(vecs.len(), 18 + 3); //bencode byte-string prefix + 18 raw bytes
+
+        let decoded = CompactAddress::from_bencode(&vecs).unwrap();
+
+        println!("{:?}", decoded);
+
+        assert_eq!(addr, decoded);
+        assert!(decoded.is_v6());
+    }
+
+    #[test]
+    fn test_compact_address_family_autodetect() {
+        let v4 = CompactAddress::new(vec![127, 0, 0, 1, 0x1a, 0xe1]);
+        assert!(v4.is_v4());
+        assert_eq!(v4.port(), 0x1ae1);
+
+        let v6_bytes = {
+            let mut b = vec![0u8; 18];
+            b[15] = 1; //::1
+            b[16] = 0x1a;
+            b[17] = 0xe1;
+            b
+        };
+        let v6 = CompactAddress::new(v6_bytes);
+        assert!(v6.is_v6());
+        assert_eq!(v6.port(), 0x1ae1);
+    }
+
+    #[test]
+    fn test_compact_address_v4_mapped_normalized_to_v4() {
+        //An IPv4-mapped IPv6 address (::ffff:a.b.c.d) arriving in an 18-byte "nodes6"/
+        //"values6" entry must be treated as V4: sending to it over a v6-only socket
+        //fails with "Network unreachable".
+        let mapped_bytes = {
+            let mut b = vec![0u8; 18];
+            b[10] = 0xff;
+            b[11] = 0xff;
+            b[12] = 178;
+            b[13] = 162;
+            b[14] = 174;
+            b[15] = 225;
+            b[16] = 0x1a;
+            b[17] = 0xe1;
+            b
+        };
+
+        let addr = CompactAddress::new(mapped_bytes);
+        assert!(addr.is_v4());
+        assert_eq!(addr.port(), 0x1ae1);
+        assert_eq!(addr.socket_addr(), std::net::SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(178, 162, 174, 225), 0x1ae1)));
+    }
+
+    #[test]
+    fn test_query_find_node_want() {
+        let find_node = KRPCMessage::find_node(NodeId::generate_nodeid(), NodeId::generate_nodeid(), Some(vec!["n4".to_string(), "n6".to_string()]), TransactionId::generate(4));
+
+        let vecs = find_node.to_bencode().unwrap();
+        let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
+
+        println!("{:?}", decoded);
+
+        assert_eq!(find_node, decoded);
+
+        if let KRPCPayload::KRPCQueryFindNodeRequest { want, .. } = decoded.payload {
+            assert_eq!(want, Some(vec!["n4".to_string(), "n6".to_string()]));
+        } else {
+            panic!("Expected KRPCQueryFindNodeRequest");
+        }
+    }
+
+    #[test]
+    fn test_get_peers_response_nodes6_values6() {
+        let node_id = NodeId::generate_nodeid();
+        let addr_v6 = CompactAddress::V6(SocketAddrV6::new(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2), 6881, 0, 0));
+
+        let nodes6 = CompactNodeList::new_from_vec(vec![CompactNode::new(NodeId::generate_nodeid(), addr_v6.clone())]);
+        let values6 = vec![addr_v6.clone()];
+
+        let response = KRPCMessage::get_peers_response(
+            node_id,
+            Token::generate(4),
+            None,
+            Some(nodes6),
+            None,
+            Some(values6.clone()),
+            TransactionId::generate(4),
+            addr_v6,
+        );
+
+        let vecs = response.to_bencode().unwrap();
+        let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
+
+        println!("{:?}", decoded);
+
+        assert_eq!(response, decoded);
+
+        if let KRPCPayload::KRPCQueryGetPeersResponse { nodes, nodes6, values, values6: decoded_values6, .. } = decoded.payload {
+            assert!(nodes.is_none());
+            assert!(nodes6.is_some());
+            assert!(values.is_none());
+            assert_eq!(decoded_values6, Some(values6));
+        } else {
+            panic!("Expected KRPCQueryGetPeersResponse");
+        }
     }
 
     #[test]

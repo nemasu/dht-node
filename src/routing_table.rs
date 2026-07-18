@@ -8,13 +8,14 @@ use crate::bucket::Buckets;
 
 use log::{debug, error, trace, warn};
 
-const PATH: &str = "rt.json";
-
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
 
     //This clients node_id
     pub node_id: NodeId,
+
+    //Path this table is persisted to/loaded from (kept separate per address family)
+    pub path: String,
 
     //Buckets
     pub buckets: Buckets,
@@ -25,8 +26,10 @@ pub struct RoutingTable {
     //Map of info_hash to node list
     pub info_hashes: HashMap<InfoHash, HashSet<NodeId>>,
 
-    //Map of node to get_peer response
-    pub tokens: HashMap<NodeId, Token>,
+    //Map of node to the tokens we've handed it in recent get_peers responses. A node may
+    //legitimately query get_peers for several info_hashes before announcing any of them, so
+    //we keep a short bounded history per node rather than only the single most recent token.
+    pub tokens: HashMap<NodeId, Vec<Token>>,
 
     //Node -> (last heard from, last refresh time)
     pub nodes_time: HashMap<NodeId, (u64,u64)>,
@@ -48,9 +51,10 @@ pub struct RoutingTable {
 
 impl RoutingTable {
 
-    pub fn new(node_id: &NodeId) -> Self {
+    pub fn new(node_id: &NodeId, path: &str) -> Self {
         RoutingTable {
             node_id: node_id.clone(),
+            path: path.to_string(),
             nodes: HashMap::new(),
             info_hashes: HashMap::new(),
             tokens: HashMap::new(),
@@ -109,11 +113,11 @@ impl RoutingTable {
 
         //node_id, info_hashes, node_times, tokens and sent_tokens are not saved
 
-        std::fs::write(PATH, data.dump()).unwrap();
+        std::fs::write(&self.path, data.dump()).unwrap();
     }
 
     //Load the routing table from a file
-    pub fn load_or_new(cmdline_node_id: Option<NodeId>) -> Self {
+    pub fn load_or_new(cmdline_node_id: Option<NodeId>, path: &str) -> Self {
 
         let node_id: Option<NodeId>;
         if let Some(id) = cmdline_node_id {
@@ -124,14 +128,15 @@ impl RoutingTable {
         }
 
         //Check if the file exists located at path
-        if Path::new(PATH).exists() {
+        if Path::new(path).exists() {
             //Load the file
-            let data = json::parse(std::fs::read_to_string(PATH).unwrap().as_str()).unwrap();
+            let data = json::parse(std::fs::read_to_string(path).unwrap().as_str()).unwrap();
 
             //NodeId
             let node_id = node_id.unwrap();
             let mut routing_table = RoutingTable {
                 node_id: node_id.clone(),
+                path: path.to_string(),
                 nodes: HashMap::new(),
                 info_hashes: HashMap::new(),
                 tokens: HashMap::new(),
@@ -171,7 +176,7 @@ impl RoutingTable {
 
         } else {
             debug!("Routing table not found, node_id: {:?}.", &node_id.clone().unwrap());
-            RoutingTable::new(&node_id.unwrap())
+            RoutingTable::new(&node_id.unwrap(), path)
         }
     }
 
@@ -213,7 +218,7 @@ impl RoutingTable {
                 }
                 
                 //Destination node_id is a random node_id in the bucket
-                let random_index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..bucket.nodes.len());
+                let random_index = rand::RngExt::random_range(&mut rand::rng(), 0..bucket.nodes.len());
                 let dest_node_id = bucket.nodes.get(random_index).unwrap();
 
                 //Skip our own node_id
@@ -264,7 +269,12 @@ impl RoutingTable {
     pub fn remove_node(&mut self, node_id: &NodeId) {
         trace!("Removing node: {:?}", node_id);
 
-        let addr = self.nodes.get(node_id).unwrap().clone();
+        let addr = self.nodes.get(node_id).cloned();
+        if addr.is_none() {
+            //Nothing to do: this node was never in this table (e.g. our own node_id,
+            //or a node belonging to the other address family's table).
+            return;
+        }
 
         self.nodes.remove(node_id);
 
@@ -283,8 +293,9 @@ impl RoutingTable {
 
         self.buckets.remove(node_id);
 
-        self.ping_info_hash.remove(&addr);
-        
+        if let Some(addr) = addr {
+            self.ping_info_hash.remove(&addr);
+        }
     }
 
     pub fn remove_node_by_addr(&mut self, addr: &CompactAddress) {
@@ -372,7 +383,7 @@ impl RoutingTable {
     }
 
     pub fn get_random_nodes(&self, amount: usize) -> Vec<CompactNode> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut node_list = Vec::new();
 
         //Get amount number of random nodes from node_list
@@ -381,7 +392,7 @@ impl RoutingTable {
         let node_list_len = self.nodes.len();
         let mut indexes: Vec<usize> = Vec::new();
         while indexes.len() < amount && indexes.len() < node_list_len {
-            let index = rand::Rng::gen_range(&mut rng, 0..node_list_len);
+            let index = rand::RngExt::random_range(&mut rng, 0..node_list_len);
             if !indexes.contains(&index) {
                 indexes.push(index);
             }
@@ -422,15 +433,23 @@ impl RoutingTable {
         self.info_hashes.get(info_hash)
     }
 
+    const MAX_TOKENS_PER_NODE: usize = 8;
+
     pub fn generate_token(&mut self, node_id: &NodeId) -> Token {
         let token = ByteArray::generate(4);
         self.node_time_update(&node_id);
-        self.tokens.insert(node_id.clone(), token.clone());
+
+        let tokens = self.tokens.entry(node_id.clone()).or_insert_with(Vec::new);
+        tokens.push(token.clone());
+        if tokens.len() > Self::MAX_TOKENS_PER_NODE {
+            tokens.remove(0);
+        }
+
         token
     }
 
-    pub fn get_token(&mut self, node_id: &NodeId) -> Option<&Token> {
-        self.tokens.get(node_id)
+    pub fn token_is_valid(&self, node_id: &NodeId, token: &Token) -> bool {
+        self.tokens.get(node_id).map(|tokens| tokens.contains(token)).unwrap_or(false)
     }
 
     pub fn remove_token(&mut self, node_id: &NodeId) {
@@ -496,7 +515,7 @@ mod tests {
     #[test]
     fn test_routing_table() {
         let node_id = NodeId::generate_nodeid();
-        let mut routing_table = RoutingTable::new(&node_id);
+        let mut routing_table = RoutingTable::new(&node_id, "rt-test.json");
 
         let addr: SocketAddrV4 = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 8080);
         let compact_addr = CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(addr));

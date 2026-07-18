@@ -1,15 +1,16 @@
 [package]
 name = "dht-node"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tokio = { version = "*", features = ["full"] }
-hex = "*"
-rand = "*"
-byteorder = "*"
-bendy = "*"
-num-bigint = "*"
-log = "*"
-simplelog = { version = "*", features = ["paris"] }
-json = "*"
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+rand = "0.10"
+byteorder = "1"
+bendy = "0.6"
+num-bigint = "0.5"
+log = "0.4"
+simplelog = { version = "0.12", features = ["paris"] }
+json = "0.12"
+socket2 = "0.6"
