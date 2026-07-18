@@ -175,7 +175,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                 //check token
                                 let token_valid = own.table.lock().await.token_is_valid(&id, &token);
                                 if !token_valid {
-                                    warn!("Token mismatch for announce_peer from {:?} for info_hash {:?}", id, info_hash);
+                                    debug!("Token mismatch for announce_peer from {:?} for info_hash {:?}", id, info_hash);
                                     let error = KRPCMessage::error(203, "Protocol Error".to_string(), msg.transaction_id.clone());
                                     if let Err(e) = own.sock.send_to(&error.to_bencode().unwrap(), src).await {
                                         warn!("Error sending error: {:?} to {:?}. Removing node.", e, src);
