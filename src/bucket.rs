@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use log::error;
+use log::{error, warn};
 
 use crate::proto::{ByteArray, NodeId};
 
@@ -59,10 +59,15 @@ impl Buckets {
         }
 
         if bucket_to_change.is_none() {
-            //Should never happen (buckets always cover the full keyspace), but decline
-            //rather than take down every other node sharing this process - nothing has
-            //been mutated yet at this point, so it's safe to just refuse this node.
-            error!("Bucket not found for node {:?}. Buckets: {:?}", node_id, self.buckets);
+            //Buckets always cover the full keyspace for any well-formed (20-byte)
+            //node_id, so this means node_id itself is malformed - most likely an
+            //oversized/undersized id from a non-compliant peer on the public network,
+            //not anything corrupted on our end (nothing has been mutated yet at this
+            //point, so it's safe to just decline this node). Not error-level: this is
+            //an anticipated, already-handled condition, and dumping the full bucket
+            //table on every occurrence was pure log noise - the id and its length are
+            //what's actually diagnostic here.
+            warn!("Bucket not found for node {:?} ({} bytes) - rejecting as malformed.", node_id, node_id.0.len());
             return false;
         }
 

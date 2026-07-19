@@ -244,7 +244,12 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                             }
                         }
                         q => {
-                            warn!("Unknown query type: {:?}", q);
+                            //Routine on the public DHT (other clients occasionally send rare/
+                            //legacy query types like "vote" that we don't implement) and already
+                            //handled correctly below (spec-compliant 204 response) - not warning-
+                            //worthy, and at real traffic volume this was drowning out actual
+                            //warnings.
+                            debug!("Unknown query type: {:?}", q);
                             //Send back 204 - Method Unknown error
                             let error = KRPCMessage::error(204, "Method Unknown".to_string(), msg.transaction_id);
                             if let Err(e) = own.sock.send_to(&error.to_bencode().unwrap(), src).await {
