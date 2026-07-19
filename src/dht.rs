@@ -108,6 +108,34 @@ impl DhtContext {
     }
 }
 
+/// Shared by both the "r" and "e" branches of `handle_packet`'s dispatch below - some
+/// real-world peers send error responses with a malformed "y" (message type) field that
+/// doesn't actually say "e", even though the payload decodes unambiguously as a
+/// `KRPCError` (dht-node's own bencode decoding, in `proto.rs`, determines message_type
+/// and payload independently from whichever top-level keys are present, so this
+/// mismatch survives decoding rather than being rejected). Handling errors payload-first
+/// means a mislabeled 202 ("please stop pestering me") still gets us to actually remove
+/// that node, instead of only ever reaching the catch-all `warn!` in the "r" branch.
+async fn handle_krpc_error(ctx: &DhtContext, transaction_id: proto::TransactionId, error: &proto::KRPCError) {
+    if error.0 == 202 {
+        debug!("Error: {:?}", error);
+
+        //If a server error occurs, just remove it from the routing table matching the target's family
+        let target_addr = {
+            let tc = ctx.transaction_counter.lock().await;
+            tc.get_addr_for_tranaction_id(transaction_id).cloned()
+        };
+
+        if let Some(target_addr) = target_addr {
+            if let Some(stack) = ctx.stack_for(&target_addr) {
+                stack.table.lock().await.remove_node_by_addr(&target_addr);
+            }
+        }
+    } else {
+        warn!("Error: {:?}", error);
+    }
+}
+
 async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8]) {
     match proto::KRPCMessage::from_bencode(buf) {
         Ok(msg) => {
@@ -390,6 +418,11 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                 }
                             }
                         }
+                        //A peer's "y" claimed this was a normal response, but the payload
+                        //unambiguously decoded as an error - see handle_krpc_error's docs.
+                        KRPCPayload::KRPCError(error) => {
+                            handle_krpc_error(ctx, msg.transaction_id, &error).await;
+                        }
                         _ => {
                             warn!("Unimplemented response type: {:?}", msg.payload);
                         }
@@ -398,23 +431,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                 "e" => {
                     match msg.payload {
                         KRPCPayload::KRPCError(error) => {
-                            if error.0 == 202 {
-                                debug!("Error: {:?}", error);
-
-                                //If a server error occurs, just remove it from the routing table matching the target's family
-                                let target_addr = {
-                                    let tc = ctx.transaction_counter.lock().await;
-                                    tc.get_addr_for_tranaction_id(msg.transaction_id).cloned()
-                                };
-
-                                if let Some(target_addr) = target_addr {
-                                    if let Some(stack) = ctx.stack_for(&target_addr) {
-                                        stack.table.lock().await.remove_node_by_addr(&target_addr);
-                                    }
-                                }
-                            } else {
-                                warn!("Error: {:?}", error);
-                            }
+                            handle_krpc_error(ctx, msg.transaction_id, &error).await;
                         }
                         _ => {
                             warn!("Unimplemented error type: {:?}", msg.payload);
