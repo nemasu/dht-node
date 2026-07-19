@@ -60,10 +60,19 @@ impl ByteArray {
         ByteArray(hex::decode(hex_str).unwrap())
     }
 
+    /// Callers should only ever pass same-length (NodeId/InfoHash-shaped) inputs, but this
+    /// still can't panic if one doesn't - a value that reached here from the wire without
+    /// going through the NODE_ID_LEN check in KRPCMessage::decode_bencode_object (or a
+    /// future caller that forgets to) shouldn't be able to crash the whole process over a
+    /// malformed packet. Missing bytes on the shorter side XOR against 0, which just makes
+    /// a malformed value's computed "distance" meaningless rather than a valid comparison -
+    /// fine, since a mismatched-length input was already invalid data with no correct
+    /// answer to give.
     pub fn xor_bytearray(a: &ByteArray, b: &ByteArray) -> ByteArray {
-        let mut result = Vec::with_capacity(a.0.len());
-        for i in 0..a.0.len() {
-            result.push(a.0[i] ^ b.0[i]);
+        let len = a.0.len().max(b.0.len());
+        let mut result = Vec::with_capacity(len);
+        for i in 0..len {
+            result.push(a.0.get(i).copied().unwrap_or(0) ^ b.0.get(i).copied().unwrap_or(0));
         }
         ByteArray::new(result)
     }
@@ -208,6 +217,12 @@ impl fmt::Debug for ByteArray {
 pub type NodeId = ByteArray;
 
 pub type InfoHash = ByteArray;
+
+/// Both NodeId and InfoHash are always 160-bit (SHA-1-sized) quantities per BEP5 - used to
+/// reject malformed `id`/`target`/`info_hash` fields from the wire at decode time (see
+/// KRPCMessage::decode_bencode_object), rather than letting a wrong-length value survive
+/// into XOR-distance code that assumes a fixed width.
+const NODE_ID_LEN: usize = 20;
 
 pub type Version = ByteArray;
 
@@ -757,10 +772,10 @@ impl FromBencode for KRPCMessage {
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
                             (b"id", value) => {
-                                id = NodeId::decode_bencode_object(value).ok();
+                                id = NodeId::decode_bencode_object(value).ok().filter(|v: &NodeId| v.0.len() == NODE_ID_LEN);
                             },
                             (b"info_hash", value) => {
-                                info_hash = InfoHash::decode_bencode_object(value).ok();
+                                info_hash = InfoHash::decode_bencode_object(value).ok().filter(|v: &InfoHash| v.0.len() == NODE_ID_LEN);
                             },
                             (b"token", value) => {
                                 token = Token::decode_bencode_object(value).ok();
@@ -775,7 +790,7 @@ impl FromBencode for KRPCMessage {
                                 seed = u32::decode_bencode_object(value).ok();
                             },
                             (b"target", value) => {
-                                target = NodeId::decode_bencode_object(value).ok();
+                                target = NodeId::decode_bencode_object(value).ok().filter(|v: &NodeId| v.0.len() == NODE_ID_LEN);
                             },
                             (b"want", value) => {
                                 want = Vec::<String>::decode_bencode_object(value).ok();
@@ -815,7 +830,7 @@ impl FromBencode for KRPCMessage {
                     while let Some(pair) = dict.next_pair()? {
                         match pair {
                             (b"id", value) => {
-                                id = NodeId::decode_bencode_object(value).ok();
+                                id = NodeId::decode_bencode_object(value).ok().filter(|v: &NodeId| v.0.len() == NODE_ID_LEN);
                             },
                             (b"p", value) => {
                                 port = u32::decode_bencode_object(value).ok();
@@ -1070,6 +1085,34 @@ mod tests {
         let vecs = hex::decode(hex_str).unwrap();
         let decoded = KRPCMessage::from_bencode(&vecs).unwrap();
         println!("{:?}", decoded);
+    }
+
+    #[test]
+    fn test_find_node_with_wrong_length_target_is_not_a_valid_query() {
+        // A real find_node query, but with a 19-byte (not 20-byte) target - regression
+        // test for a remotely-triggerable panic: this used to decode into a
+        // KRPCQueryFindNodeRequest with a malformed target anyway, which later panicked
+        // ("index out of bounds") the first time something computed an XOR distance
+        // against it (e.g. the multiplexing demux's identity-guessing, or a get_peers/
+        // find_node response). It must instead fail to decode as that query variant at
+        // all - see the NODE_ID_LEN filters in decode_bencode_object.
+        let id20 = "A".repeat(NODE_ID_LEN);
+        let target19 = "A".repeat(NODE_ID_LEN - 1);
+        let bencoded = format!("d1:ad2:id20:{}6:target19:{}e1:q9:find_node1:t2:aa1:y1:qe", id20, target19);
+        let decoded = KRPCMessage::from_bencode(bencoded.as_bytes()).unwrap();
+        assert!(
+            !matches!(decoded.payload, KRPCPayload::KRPCQueryFindNodeRequest { .. }),
+            "a malformed-length target must not produce a valid FindNodeRequest: {:?}",
+            decoded.payload
+        );
+    }
+
+    #[test]
+    fn test_xor_bytearray_does_not_panic_on_mismatched_lengths() {
+        let a = NodeId::new(vec![0xFF; NODE_ID_LEN]);
+        let b = NodeId::new(vec![0xFF; NODE_ID_LEN - 1]);
+        let result = ByteArray::xor_bytearray(&a, &b);
+        assert_eq!(result.0.len(), NODE_ID_LEN);
     }
 
     #[test]
