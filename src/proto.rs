@@ -285,6 +285,18 @@ impl CompactAddress {
         matches!(self, CompactAddress::V6(_))
     }
 
+    /// True if this is the "unspecified" placeholder address (all-zero IP and/or port
+    /// 0) - never a legitimate remote peer contact, but nothing validates compact node/
+    /// peer entries decoded from the wire, so malformed or malicious data can produce
+    /// one. Sending to it fails with EINVAL, so callers should skip it rather than
+    /// store/use it and find out on the next send attempt.
+    pub fn is_unspecified(&self) -> bool {
+        match self {
+            CompactAddress::V4(addr) => addr.ip().is_unspecified() || addr.port() == 0,
+            CompactAddress::V6(addr) => addr.ip().is_unspecified() || addr.port() == 0,
+        }
+    }
+
     /// Encode with the "Compact IP-address/port info" format
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
@@ -1183,6 +1195,35 @@ mod tests {
         let v6 = CompactAddress::new(v6_bytes);
         assert!(v6.is_v6());
         assert_eq!(v6.port(), 0x1ae1);
+    }
+
+    #[test]
+    fn test_compact_address_is_unspecified() {
+        // All-zero (IP and port) - the classic malformed/empty compact address.
+        assert!(CompactAddress::new(vec![0, 0, 0, 0, 0, 0]).is_unspecified());
+        // Zero port alone is enough to make send_to() fail with EINVAL, regardless of IP.
+        assert!(CompactAddress::new(vec![127, 0, 0, 1, 0, 0]).is_unspecified());
+        // Zero IP alone, non-zero port - still not a real peer address.
+        assert!(CompactAddress::new(vec![0, 0, 0, 0, 0x1a, 0xe1]).is_unspecified());
+        // A real-looking address should not be flagged.
+        assert!(!CompactAddress::new(vec![127, 0, 0, 1, 0x1a, 0xe1]).is_unspecified());
+
+        let v6_zero = {
+            let mut b = vec![0u8; 18];
+            b[16] = 0x1a;
+            b[17] = 0xe1;
+            b
+        };
+        assert!(CompactAddress::new(v6_zero).is_unspecified());
+
+        let v6_real = {
+            let mut b = vec![0u8; 18];
+            b[15] = 1; //::1
+            b[16] = 0x1a;
+            b[17] = 0xe1;
+            b
+        };
+        assert!(!CompactAddress::new(v6_real).is_unspecified());
     }
 
     #[test]

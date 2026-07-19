@@ -368,6 +368,12 @@ impl RoutingTable {
     }
 
     pub fn add_node(&mut self, node_id: NodeId, addr: CompactAddress) {
+        //Nothing validates compact node entries decoded from the wire, so a malformed
+        //or malicious peer can hand us an unspecified (0.0.0.0:0-shaped) address -
+        //reject it here rather than storing it and finding out on the next send.
+        if addr.is_unspecified() {
+            return;
+        }
         //Only add this node if it's added to a bucket.
         if self.buckets.add(node_id.clone()) {
             self.node_time_update(&node_id);
@@ -377,6 +383,9 @@ impl RoutingTable {
 
     //This is used to add nodes that we have heard about, but not heard from yet.
     pub fn add_node_reference(&mut self, node_id: NodeId, addr: CompactAddress) {
+        if addr.is_unspecified() {
+            return;
+        }
         //Only add this node if it's added to a bucket.
         if self.buckets.add(node_id.clone()) {
             let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - (15*60);
@@ -573,6 +582,26 @@ mod tests {
         let node_list = routing_table.get_node_list_for_info_hash(&info_hash);
         println!("{:?}", node_list);
         assert_eq!(node_id, node_list.0.0.get(0).unwrap().id);
+    }
+
+    #[test]
+    fn test_add_node_rejects_unspecified_address() {
+        let node_id = NodeId::generate_nodeid();
+        let mut routing_table = RoutingTable::new(&node_id, None);
+
+        let bad_addr = CompactAddress::new(vec![0, 0, 0, 0, 0, 0]);
+        routing_table.add_node(NodeId::generate_nodeid(), bad_addr);
+        assert_eq!(routing_table.nodes.len(), 0, "an unspecified address must not be stored");
+    }
+
+    #[test]
+    fn test_add_node_reference_rejects_unspecified_address() {
+        let node_id = NodeId::generate_nodeid();
+        let mut routing_table = RoutingTable::new(&node_id, None);
+
+        let bad_addr = CompactAddress::new(vec![127, 0, 0, 1, 0, 0]); // real IP, zero port
+        routing_table.add_node_reference(NodeId::generate_nodeid(), bad_addr);
+        assert_eq!(routing_table.nodes.len(), 0, "a zero-port address must not be stored");
     }
 
     fn dummy_addr() -> CompactAddress {

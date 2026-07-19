@@ -199,7 +199,12 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
 
                                 let announced_addr = resolve_announced_addr(src, port, implied_port);
 
-                                let _ = ctx.event_tx.send(DhtEvent::PeerAnnounced { info_hash: info_hash.clone(), node_id: id.clone(), peer: announced_addr });
+                                //A malicious/malformed announce_peer can set port=0 (src itself is
+                                //always a real address, so only the announced port can be bad here)
+                                //- not a real peer, so don't report it downstream.
+                                if !announced_addr.is_unspecified() {
+                                    let _ = ctx.event_tx.send(DhtEvent::PeerAnnounced { info_hash: info_hash.clone(), node_id: id.clone(), peer: announced_addr });
+                                }
 
                                 //Response
                                 let get_peers_response = KRPCMessage::id_response(ctx.node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(src));
@@ -340,6 +345,15 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                 }
 
                                 for value in all_values {
+                                    //Nothing validates "values"/"values6" entries decoded from the
+                                    //wire, so a malformed or malicious peer can hand us an
+                                    //unspecified (0.0.0.0:0-shaped) address here - it's not a real
+                                    //discovered peer, and pinging it would just fail with EINVAL, so
+                                    //skip it entirely rather than reporting/pinging garbage.
+                                    if value.is_unspecified() {
+                                        continue;
+                                    }
+
                                     let _ = ctx.event_tx.send(DhtEvent::PeerDiscovered { info_hash: info_hash.clone(), peer: value.clone() });
 
                                     if let Some(stack) = ctx.stack_for(&value) {
