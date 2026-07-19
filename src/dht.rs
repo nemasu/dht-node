@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace, warn};
 
 const BOOTSTRAP_HOSTS: &[&str] = &["router.bittorrent.com:6881", "router.utorrent.com:6881", "dht.transmissionbt.com:6881", "dht.aelitis.com:6881"];
 
@@ -677,7 +677,7 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
                 addrs
             };
 
-            info!(
+            debug!(
                 "No nodes in routing table, bootstrapping ({}) from {} address(es){}",
                 if want_v4 { "IPv4" } else { "IPv6" },
                 bootstrap_addrs.len(),
