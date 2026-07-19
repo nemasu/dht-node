@@ -467,15 +467,33 @@ impl RoutingTable {
     }
 }
 
+/// Generates outgoing KRPC transaction ids (the "t" field, echoed back verbatim by the
+/// remote peer in its response/error) and remembers which address each one was sent to.
+///
+/// `key_prefix` occupies the top 16 bits of every id this counter produces; `new()` (the
+/// single-socket `DhtNode::start` path) leaves it at 0 and uses the full 32-bit space,
+/// while `new_multiplexed(key)` (nodes sharing a `DhtSocket`) reserves the top 16 bits for
+/// `key` so a shared receive loop can tell which registered identity a response belongs
+/// to purely by decoding the echoed transaction id - see `key_of`.
 pub struct TransactionCounter {
-    pub transaction_id: i32,
+    key_prefix: i32,
+    counter: u16,
 
     pub id_addr_map: HashMap<i32, CompactAddress>,
 }
 impl TransactionCounter {
     pub fn new() -> Self {
         TransactionCounter {
-            transaction_id: 0,
+            key_prefix: 0,
+            counter: 0,
+            id_addr_map: HashMap::new(),
+        }
+    }
+
+    pub fn new_multiplexed(key: u16) -> Self {
+        TransactionCounter {
+            key_prefix: (key as i32) << 16,
+            counter: 0,
             id_addr_map: HashMap::new(),
         }
     }
@@ -497,13 +515,26 @@ impl TransactionCounter {
         self.id_addr_map.get(&int_id)
     }
 
+    /// Decodes the multiplexing key (top 16 bits) a `new_multiplexed` counter embedded in
+    /// `id`, or `None` if `id` isn't a well-formed 4-byte transaction id. Used only by the
+    /// `DhtSocket` shared receive loop to route an "r"/"e" message to the identity that
+    /// issued the matching query - unrelated to (and doesn't consume) `id_addr_map`.
+    pub fn key_of(id: &TransactionId) -> Option<u16> {
+        if id.0.len() != 4 {
+            return None;
+        }
+        let int_id = i32::from_be_bytes([id.0[0], id.0[1], id.0[2], id.0[3]]);
+        Some(((int_id >> 16) & 0xFFFF) as u16)
+    }
+
     pub fn get_transaction_id(&mut self, addr: CompactAddress) -> ByteArray {
-        self.transaction_id += 1;
+        self.counter = self.counter.wrapping_add(1);
+        let id = self.key_prefix | (self.counter as i32);
 
         //Add the transaction id to the map
-        self.id_addr_map.insert(self.transaction_id, addr);
+        self.id_addr_map.insert(id, addr);
 
-        ByteArray::new_from_i32(self.transaction_id)
+        ByteArray::new_from_i32(id)
     }
 }
 
@@ -542,5 +573,43 @@ mod tests {
         let node_list = routing_table.get_node_list_for_info_hash(&info_hash);
         println!("{:?}", node_list);
         assert_eq!(node_id, node_list.0.0.get(0).unwrap().id);
+    }
+
+    fn dummy_addr() -> CompactAddress {
+        CompactAddress::new_from_sockaddr(std::net::SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881)))
+    }
+
+    #[test]
+    fn test_transaction_counter_new_has_no_key() {
+        let mut tc = TransactionCounter::new();
+        let id = tc.get_transaction_id(dummy_addr());
+        assert_eq!(TransactionCounter::key_of(&id), Some(0));
+    }
+
+    #[test]
+    fn test_transaction_counter_multiplexed_key_round_trips() {
+        for key in [0u16, 1, 42, 1000, 65535] {
+            let mut tc = TransactionCounter::new_multiplexed(key);
+            for _ in 0..10 {
+                let id = tc.get_transaction_id(dummy_addr());
+                assert_eq!(TransactionCounter::key_of(&id), Some(key), "key mismatch for prefix {}", key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_transaction_counter_key_of_rejects_wrong_length() {
+        assert_eq!(TransactionCounter::key_of(&TransactionId::new(vec![1, 2, 3])), None);
+        assert_eq!(TransactionCounter::key_of(&TransactionId::new(vec![1, 2, 3, 4, 5])), None);
+    }
+
+    #[test]
+    fn test_transaction_counter_counter_wraps_without_disturbing_key() {
+        let key = 7u16;
+        let mut tc = TransactionCounter::new_multiplexed(key);
+        for _ in 0..(u16::MAX as u32 + 5) {
+            let id = tc.get_transaction_id(dummy_addr());
+            assert_eq!(TransactionCounter::key_of(&id), Some(key));
+        }
     }
 }
