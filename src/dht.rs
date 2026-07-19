@@ -15,7 +15,7 @@ use log::{debug, error, info, trace, warn};
 const BOOTSTRAP_HOSTS: &[&str] = &["router.bittorrent.com:6881", "router.utorrent.com:6881", "dht.transmissionbt.com:6881", "dht.aelitis.com:6881"];
 
 async fn resolve_hostname(hostname: &str, want_v4: bool) -> Option<SocketAddr> {
-    match std::net::ToSocketAddrs::to_socket_addrs(&hostname) {
+    match tokio::net::lookup_host(hostname).await {
         Ok(addrs) => {
             for a in addrs {
                 if a.is_ipv4() == want_v4 {
