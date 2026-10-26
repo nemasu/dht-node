@@ -73,6 +73,22 @@ impl RoutingTable {
         }
     }
 
+    /// Rebuild buckets for a new local ID, retaining contacts that fit and issued tokens.
+    pub(crate) fn rekey(&mut self, id: NodeId) {
+        self.node_id = id.clone();
+        self.buckets = Buckets::new(&id);
+        let mut rejected = Vec::new();
+        for node in self.nodes.keys() {
+            if *node == id || !self.buckets.add(node.clone()) {
+                rejected.push(node.clone());
+            }
+        }
+        //Lookups in flight (get_peer_info_hash, ping_info_hash) don't depend on our ID; keep them.
+        for node in rejected {
+            self.remove_node(&node);
+        }
+    }
+
     pub fn debug_stats(&mut self) {
 
         if     self.last_printed_nodes_len != self.nodes.len()
@@ -489,6 +505,8 @@ pub struct TransactionCounter {
     counter: u16,
 
     pub id_addr_map: HashMap<i32, CompactAddress>,
+    sent_at: HashMap<i32, std::time::Instant>,
+    last_prune: std::time::Instant,
 }
 impl TransactionCounter {
     pub fn new() -> Self {
@@ -496,6 +514,8 @@ impl TransactionCounter {
             key_prefix: 0,
             counter: 0,
             id_addr_map: HashMap::new(),
+            sent_at: HashMap::new(),
+            last_prune: std::time::Instant::now(),
         }
     }
 
@@ -504,6 +524,8 @@ impl TransactionCounter {
             key_prefix: (key as i32) << 16,
             counter: 0,
             id_addr_map: HashMap::new(),
+            sent_at: HashMap::new(),
+            last_prune: std::time::Instant::now(),
         }
     }
 
@@ -536,15 +558,49 @@ impl TransactionCounter {
         Some(((int_id >> 16) & 0xFFFF) as u16)
     }
 
+    pub(crate) fn pending_response(&self, id: &TransactionId, src: std::net::SocketAddr) -> bool {
+        let Ok(bytes) = <[u8; 4]>::try_from(id.0.as_slice()) else { return false; };
+        let key = i32::from_be_bytes(bytes);
+        self.id_addr_map.get(&key).is_some_and(|addr| same_endpoint(addr, src))
+            && self.sent_at.get(&key).is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60))
+    }
+
+    /// Accept a response once, from the exact destination, within 60 seconds.
+    pub fn accept_response(&mut self, id: &TransactionId, src: std::net::SocketAddr) -> bool {
+        let Ok(bytes) = <[u8; 4]>::try_from(id.0.as_slice()) else { return false; };
+        let key = i32::from_be_bytes(bytes);
+        if !self.id_addr_map.get(&key).is_some_and(|addr| same_endpoint(addr, src)) {
+            return false;
+        }
+        let fresh = self.sent_at.get(&key).is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60));
+        self.id_addr_map.remove(&key);
+        self.sent_at.remove(&key);
+        fresh
+    }
+
     pub fn get_transaction_id(&mut self, addr: CompactAddress) -> ByteArray {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_prune) >= std::time::Duration::from_secs(60) {
+            self.sent_at.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(60));
+            self.id_addr_map.retain(|key, _| self.sent_at.contains_key(key));
+            self.last_prune = now;
+        }
         self.counter = self.counter.wrapping_add(1);
         let id = self.key_prefix | (self.counter as i32);
 
         //Add the transaction id to the map
         self.id_addr_map.insert(id, addr);
+        self.sent_at.insert(id, now);
 
         ByteArray::new_from_i32(id)
     }
+}
+
+/// Compare IP and port only: SocketAddrV6 equality also checks scope_id/flowinfo,
+/// which CompactAddress doesn't carry (e.g. replies from link-local peers).
+fn same_endpoint(addr: &CompactAddress, src: std::net::SocketAddr) -> bool {
+    let expected = addr.socket_addr();
+    expected.ip() == src.ip() && expected.port() == src.port()
 }
 
 #[cfg(test)]
@@ -640,5 +696,55 @@ mod tests {
             let id = tc.get_transaction_id(dummy_addr());
             assert_eq!(TransactionCounter::key_of(&id), Some(key));
         }
+    }
+}
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    #[test]
+    fn responses_require_live_matching_transaction_and_cannot_replay() {
+        let src = "8.8.8.8:6881".parse().unwrap();
+        let mut tc = TransactionCounter::new();
+        let id = tc.get_transaction_id(CompactAddress::new_from_sockaddr(src));
+        assert!(!tc.accept_response(&id, "8.8.4.4:6881".parse().unwrap()));
+        assert!(!tc.accept_response(&id, "8.8.8.8:6882".parse().unwrap()));
+        assert!(tc.accept_response(&id, src));
+        assert!(!tc.accept_response(&id, src));
+        assert!(!tc.accept_response(&TransactionId::new(vec![0]), src));
+        let id = tc.get_transaction_id(CompactAddress::new_from_sockaddr(src));
+        let key = i32::from_be_bytes(id.0.as_slice().try_into().unwrap());
+        tc.sent_at.insert(key, std::time::Instant::now() - std::time::Duration::from_secs(61));
+        assert!(!tc.accept_response(&id, src));
+    }
+
+    #[test]
+    fn accept_response_ignores_ipv6_scope_and_flowinfo() {
+        let mut tc = TransactionCounter::new();
+        let sent: std::net::SocketAddr = "[fe80::1]:6881".parse().unwrap();
+        let id = tc.get_transaction_id(CompactAddress::new_from_sockaddr(sent));
+        let src = std::net::SocketAddr::V6(std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 6881, 7, 3));
+        assert!(tc.pending_response(&id, src));
+        assert!(tc.accept_response(&id, src));
+    }
+
+    #[test]
+    fn rekey_keeps_lookups_and_fully_removes_evicted_nodes() {
+        let mut table = RoutingTable::new(&NodeId::generate_nodeid(), None);
+        let info_hash = NodeId::generate_nodeid();
+        let tx = ByteArray::new_from_i32(1);
+        let value = CompactAddress::new_from_sockaddr("1.2.3.4:6881".parse().unwrap());
+        table.get_peer_info_hash.insert(tx.clone(), info_hash.clone());
+        table.ping_info_hash.insert(value.clone(), info_hash.clone());
+        let new_id = NodeId::generate_nodeid();
+        // A node equal to our new ID is always evicted.
+        table.add_node(new_id.clone(), CompactAddress::new_from_sockaddr("5.6.7.8:6881".parse().unwrap()));
+        table.add_info_hash(info_hash.clone(), new_id.clone());
+        table.generate_token(&new_id);
+        table.rekey(new_id.clone());
+        assert_eq!(table.get_peer_info_hash.get(&tx), Some(&info_hash));
+        assert_eq!(table.ping_info_hash.get(&value), Some(&info_hash));
+        assert!(!table.nodes.contains_key(&new_id));
+        assert!(!table.tokens.contains_key(&new_id));
+        assert!(table.info_hashes.get(&info_hash).map_or(true, |nodes| !nodes.contains(&new_id)));
     }
 }

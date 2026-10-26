@@ -41,6 +41,9 @@ impl ByteArray {
         ret
     }
 
+    /// Raw random ID (also used as the seed before public-IP discovery).
+    /// Use `bep42::generate_id(ip)` for a known external IP, or leave the node's
+    /// configured ID unset to use automatic BEP 42 generation.
     pub fn generate_nodeid() -> ByteArray {
         ByteArray::generate(20)
     }

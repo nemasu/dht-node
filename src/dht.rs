@@ -1,5 +1,6 @@
 use bendy::{decoding::FromBencode, encoding::ToBencode};
 use crate::proto::{self, ByteArray, CompactAddress, InfoHash, KRPCMessage, KRPCPayload, NodeId, Version};
+use crate::bep42::{self, Bep42Config, ExternalAddresses};
 use crate::routing_table::{RoutingTable, TransactionCounter};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
@@ -7,10 +8,10 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, RwLock},
     time::{Duration, Instant},
 };
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 const BOOTSTRAP_HOSTS: &[&str] = &["router.bittorrent.com:6881", "router.utorrent.com:6881", "dht.transmissionbt.com:6881", "dht.aelitis.com:6881"];
 
@@ -36,6 +37,19 @@ async fn resolve_hostname(hostname: &str, want_v4: bool) -> Option<SocketAddr> {
 struct Stack {
     sock: Arc<UdpSocket>,
     table: Arc<Mutex<RoutingTable>>,
+    id: Arc<RwLock<NodeId>>,
+    automatic: bool,
+    is_v4: bool,
+    //External::generation last applied to this stack's ID.
+    applied: Arc<AtomicU64>,
+}
+
+/// Address votes shared by every identity on a socket. `generation` is bumped (under the
+/// lock) whenever an agreed address changes, so identities only lock when there is news.
+#[derive(Default)]
+struct External {
+    addresses: Mutex<ExternalAddresses>,
+    generation: AtomicU64,
 }
 
 /// What a library consumer can learn from this node as it participates in the DHT.
@@ -46,7 +60,8 @@ struct Stack {
 pub enum DhtEvent {
     /// A remote node sent us an announce_peer query: it explicitly holds data for
     /// `info_hash`, reachable at `peer`.
-    PeerAnnounced { info_hash: InfoHash, node_id: NodeId, peer: CompactAddress },
+    /// `version` is the announcing node's KRPC "v" client/version, if it sent one.
+    PeerAnnounced { info_hash: InfoHash, node_id: NodeId, peer: CompactAddress, version: Option<Version> },
     /// One of our own get_peers queries got back a values/values6 entry: `peer` holds
     /// data for `info_hash`.
     PeerDiscovered { info_hash: InfoHash, peer: CompactAddress },
@@ -54,7 +69,7 @@ pub enum DhtEvent {
     /// somewhere in the swarm. `querier`/`querier_addr` identify who asked, but a node
     /// asking about a hash is not confirmed to hold it - don't treat `querier_addr` as
     /// a metadata source the way you would `PeerAnnounced`/`PeerDiscovered`'s `peer`.
-    InfoHashObserved { info_hash: InfoHash, querier: NodeId, querier_addr: CompactAddress },
+    InfoHashObserved { info_hash: InfoHash, querier: NodeId, querier_addr: CompactAddress, version: Option<Version> },
 }
 
 /// Shared state visible to every socket's receive loop. Holds both stacks (when dual-stack)
@@ -62,16 +77,52 @@ pub enum DhtEvent {
 /// routing table.
 #[derive(Clone)]
 struct DhtContext {
-    node_id: NodeId,
     v4: Option<Stack>,
     v6: Option<Stack>,
     transaction_counter: Arc<Mutex<TransactionCounter>>,
     invalid_ping_response_version: Version,
     event_tx: mpsc::UnboundedSender<DhtEvent>,
     bootstrap_nodes: Vec<SocketAddr>,
+    bep42: Bep42Config,
+    external: Arc<External>,
 }
 
 impl DhtContext {
+    async fn sync_identity(&self, stack: &Stack) -> NodeId {
+        if stack.automatic && stack.applied.load(Ordering::Acquire) != self.external.generation.load(Ordering::Acquire) {
+            let (generation, ip) = {
+                let mut addresses = self.external.addresses.lock().await;
+                (self.external.generation.load(Ordering::Acquire),
+                 self.bep42.pinned(stack.is_v4).or(addresses.family(stack.is_v4).current))
+            };
+            // The table lock orders concurrent updates; never apply an older generation.
+            let mut table = stack.table.lock().await;
+            if stack.applied.load(Ordering::Acquire) < generation {
+                if let Some(ip) = ip {
+                    let mut id = table.node_id.clone();
+                    bep42::secure_id(&mut id, ip);
+                    if id != table.node_id {
+                        table.rekey(id.clone());
+                        *stack.id.write().unwrap() = id.clone();
+                        info!("BEP 42 identity updated for {}: {:?}", ip, id);
+                    }
+                }
+                stack.applied.store(generation, Ordering::Release);
+            }
+        }
+        stack.id.read().unwrap().clone()
+    }
+
+    /// The active stacks: IPv4 first, then IPv6.
+    fn stacks(&self) -> impl Iterator<Item = &Stack> {
+        self.v4.iter().chain(self.v6.iter())
+    }
+
+    /// Whether this stack learns its public IP from the `ip` field of replies.
+    fn learns_address(&self, stack: &Stack) -> bool {
+        stack.automatic && self.bep42.pinned(stack.is_v4).is_none()
+    }
+
     /// The BEP32 "want" value matching the families this node currently runs.
     fn want_list(&self) -> Vec<String> {
         let mut want = Vec::new();
@@ -116,20 +167,12 @@ impl DhtContext {
 /// mismatch survives decoding rather than being rejected). Handling errors payload-first
 /// means a mislabeled 202 ("please stop pestering me") still gets us to actually remove
 /// that node, instead of only ever reaching the catch-all `warn!` in the "r" branch.
-async fn handle_krpc_error(ctx: &DhtContext, transaction_id: proto::TransactionId, error: &proto::KRPCError) {
+async fn handle_krpc_error(ctx: &DhtContext, src: SocketAddr, error: &proto::KRPCError) {
     if error.0 == 202 {
         debug!("Error: {:?}", error);
-
-        //If a server error occurs, just remove it from the routing table matching the target's family
-        let target_addr = {
-            let tc = ctx.transaction_counter.lock().await;
-            tc.get_addr_for_tranaction_id(transaction_id).cloned()
-        };
-
-        if let Some(target_addr) = target_addr {
-            if let Some(stack) = ctx.stack_for(&target_addr) {
-                stack.table.lock().await.remove_node_by_addr(&target_addr);
-            }
+        let addr = CompactAddress::new_from_sockaddr(src);
+        if let Some(stack) = ctx.stack_for(&addr) {
+            stack.table.lock().await.remove_node_by_addr(&addr);
         }
     } else {
         warn!("Error: {:?}", error);
@@ -140,17 +183,32 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
     match proto::KRPCMessage::from_bencode(buf) {
         Ok(msg) => {
             trace!("Received: {:?} from {:?}", msg, src);
+            if msg.message_type == "r" || msg.message_type == "e" {
+                if !ctx.transaction_counter.lock().await.accept_response(&msg.transaction_id, src) {
+                    debug!("Ignoring unsolicited, stale or wrong-source DHT reply from {}", src);
+                    return;
+                }
+                if ctx.learns_address(own) {
+                    if let Some(reported) = &msg.ip {
+                        let mut addresses = ctx.external.addresses.lock().await;
+                        if addresses.family(own.is_v4).observe(src.ip(), reported.socket_addr().ip(), Instant::now()) {
+                            ctx.external.generation.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                }
+            }
+            let node_id = ctx.sync_identity(own).await;
 
             match msg.message_type.as_str() {
                 "q" => {
                     match msg.query.as_deref().unwrap_or("") {
                         "ping" => {
                             if let KRPCPayload::KRPCQueryPingRequest { id } = msg.payload {
-                                debug!("Received ping from {:?}", id);
+                                debug!("Received ping from {:?}{}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()));
 
                                 own.table.lock().await.ping_update(&id.clone());
 
-                                let ping_response = KRPCMessage::id_response(ctx.node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(src));
+                                let ping_response = KRPCMessage::id_response(node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(src));
 
                                 trace!("sending ping response: {:?}", ping_response);
 
@@ -162,11 +220,11 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                         }
                         "get_peers" => {
                             if let KRPCPayload::KRPCQueryGetPeersRequest { id, info_hash, want } = msg.payload {
-                                debug!("Received get_peers from {:?} for info_hash {:?}", id, info_hash);
+                                debug!("Received get_peers from {:?}{} for info_hash {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), info_hash);
 
                                 own.table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(src));
 
-                                let _ = ctx.event_tx.send(DhtEvent::InfoHashObserved { info_hash: info_hash.clone(), querier: id.clone(), querier_addr: CompactAddress::new_from_sockaddr(src) });
+                                let _ = ctx.event_tx.send(DhtEvent::InfoHashObserved { info_hash: info_hash.clone(), querier: id.clone(), querier_addr: CompactAddress::new_from_sockaddr(src), version: msg.version.clone() });
 
                                 let effective_want = ctx.effective_want(&want, src.is_ipv4());
 
@@ -192,7 +250,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
 
                                 let token = own.table.lock().await.generate_token(&id);
 
-                                let get_peers_response = KRPCMessage::get_peers_response(ctx.node_id.clone(), token, nodes_v4, nodes_v6, values_v4, values_v6, msg.transaction_id, CompactAddress::new_from_sockaddr(src));
+                                let get_peers_response = KRPCMessage::get_peers_response(node_id.clone(), token, nodes_v4, nodes_v6, values_v4, values_v6, msg.transaction_id, CompactAddress::new_from_sockaddr(src));
 
                                 trace!("sending get_peers response: {:?}", get_peers_response);
 
@@ -204,13 +262,14 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                         }
                         "announce_peer" => {
                             if let KRPCPayload::KRPCQueryAnnouncePeerRequest{ id, info_hash, port, token, implied_port, seed: _ } = msg.payload {
-                                debug!("Received announce_peer from {:?} for info_hash {:?}", id, info_hash);
+                                debug!("Received announce_peer from {:?}{} for info_hash {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), info_hash);
 
                                 //check token
                                 let token_valid = own.table.lock().await.token_is_valid(&id, &token);
                                 if !token_valid {
-                                    debug!("Token mismatch for announce_peer from {:?} for info_hash {:?}", id, info_hash);
-                                    let error = KRPCMessage::error(203, "Protocol Error".to_string(), msg.transaction_id.clone());
+                                    debug!("Token mismatch for announce_peer from {:?}{} for info_hash {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), info_hash);
+                                    let mut error = KRPCMessage::error(203, "Protocol Error".to_string(), msg.transaction_id.clone());
+                                    error.ip = Some(CompactAddress::new_from_sockaddr(src));
                                     if let Err(e) = own.sock.send_to(&error.to_bencode().unwrap(), src).await {
                                         warn!("Error sending error: {:?} to {:?}. Removing node.", e, src);
                                         own.table.lock().await.remove_node(&id);
@@ -231,11 +290,11 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                 //always a real address, so only the announced port can be bad here)
                                 //- not a real peer, so don't report it downstream.
                                 if !announced_addr.is_unspecified() {
-                                    let _ = ctx.event_tx.send(DhtEvent::PeerAnnounced { info_hash: info_hash.clone(), node_id: id.clone(), peer: announced_addr });
+                                    let _ = ctx.event_tx.send(DhtEvent::PeerAnnounced { info_hash: info_hash.clone(), node_id: id.clone(), peer: announced_addr, version: msg.version.clone() });
                                 }
 
                                 //Response
-                                let get_peers_response = KRPCMessage::id_response(ctx.node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(src));
+                                let get_peers_response = KRPCMessage::id_response(node_id.clone(), msg.transaction_id, CompactAddress::new_from_sockaddr(src));
 
                                 trace!("sending annouce_peers response: {:?}", get_peers_response);
 
@@ -247,7 +306,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                         }
                         "find_node" => {
                             if let KRPCPayload::KRPCQueryFindNodeRequest{ id, target, want } = msg.payload {
-                                debug!("Received find_node from {:?} for target {:?}", id, target);
+                                debug!("Received find_node from {:?}{} for target {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), target);
 
                                 own.table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(src));
 
@@ -266,7 +325,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                     }
                                 }
 
-                                let find_node_response = KRPCMessage::find_node_response(ctx.node_id.clone(), nodes_v4, nodes_v6, msg.transaction_id, CompactAddress::new_from_sockaddr(src));
+                                let find_node_response = KRPCMessage::find_node_response(node_id.clone(), nodes_v4, nodes_v6, msg.transaction_id, CompactAddress::new_from_sockaddr(src));
 
                                 trace!("sending find_node response: {:?}", find_node_response);
 
@@ -284,7 +343,8 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                             //warnings.
                             debug!("Unknown query type: {:?}", q);
                             //Send back 204 - Method Unknown error
-                            let error = KRPCMessage::error(204, "Method Unknown".to_string(), msg.transaction_id);
+                            let mut error = KRPCMessage::error(204, "Method Unknown".to_string(), msg.transaction_id);
+                            error.ip = Some(CompactAddress::new_from_sockaddr(src));
                             if let Err(e) = own.sock.send_to(&error.to_bencode().unwrap(), src).await {
                                 warn!("Error sending error: {:?} to {:?}.", e, src);
                             }
@@ -293,7 +353,6 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                 }
                 "r" => {
                     match msg.payload {
-                        //TODO check the transaction id
                         KRPCPayload::KRPCQueryIdResponse {id, p: _ } => { //P is this hosts port
                             let addr = CompactAddress::new_from_sockaddr(src);
                             let mut suspicious = false;
@@ -305,7 +364,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                 if let Some(node_local) = node_local {
                                     if *node_local != addr {
 
-                                        if id == ctx.node_id {
+                                        if id == node_id {
                                             if msg.version.is_some() && msg.version.clone().unwrap() == ctx.invalid_ping_response_version {
                                                 debug!("Node with version {:?} is replying to pings with our node_id, ignoring.", msg.version.unwrap());
                                             } else {
@@ -345,7 +404,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                             own.table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(src));
 
                             //Add nodes to routing table, each routed to the table matching its own family
-                            trace!("get_peers response from {:?}. Nodes: {:?}, Nodes6: {:?}", id, nodes, nodes6);
+                            trace!("get_peers response from {:?}{}. Nodes: {:?}, Nodes6: {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), nodes, nodes6);
                             if let Some(nodes) = nodes {
                                 for node in nodes.0 {
                                     if let Some(stack) = ctx.stack_for(&node.addr) {
@@ -388,7 +447,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                                         stack.table.lock().await.ping_info_hash.insert(value.clone(), info_hash.clone());
 
                                         //Ping the node
-                                        let ping = proto::KRPCMessage::ping(ctx.node_id.clone(), ctx.transaction_counter.lock().await.get_transaction_id(value.clone()));
+                                        let ping = proto::KRPCMessage::ping(ctx.sync_identity(stack).await, ctx.transaction_counter.lock().await.get_transaction_id(value.clone()));
                                         if let Err(e) = stack.sock.send_to(&ping.to_bencode().unwrap(), value.socket_addr()).await {
                                             warn!("Error sending ping: {:?} to {:?}.", e, value);
                                         }
@@ -402,7 +461,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                             own.table.lock().await.add_node(id.clone(), CompactAddress::new_from_sockaddr(src));
 
                             //Add nodes to routing table, each routed to the table matching its own family
-                            trace!("find_node response from {:?}. Nodes: {:?}, Nodes6: {:?}", id, nodes, nodes6);
+                            trace!("find_node response from {:?}{}. Nodes: {:?}, Nodes6: {:?}", id, bep42::compliance_note(&id, src.ip(), msg.version.as_ref()), nodes, nodes6);
                             if let Some(nodes) = nodes {
                                 for node in nodes.0 {
                                     if let Some(stack) = ctx.stack_for(&node.addr) {
@@ -421,7 +480,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                         //A peer's "y" claimed this was a normal response, but the payload
                         //unambiguously decoded as an error - see handle_krpc_error's docs.
                         KRPCPayload::KRPCError(error) => {
-                            handle_krpc_error(ctx, msg.transaction_id, &error).await;
+                            handle_krpc_error(ctx, src, &error).await;
                         }
                         _ => {
                             warn!("Unimplemented response type: {:?}", msg.payload);
@@ -431,7 +490,7 @@ async fn handle_packet(ctx: &DhtContext, own: &Stack, src: SocketAddr, buf: &[u8
                 "e" => {
                     match msg.payload {
                         KRPCPayload::KRPCError(error) => {
-                            handle_krpc_error(ctx, msg.transaction_id, &error).await;
+                            handle_krpc_error(ctx, src, &error).await;
                         }
                         _ => {
                             warn!("Unimplemented error type: {:?}", msg.payload);
@@ -522,8 +581,16 @@ impl Registry {
 
     /// All currently-registered (key, node_id) pairs, for the XOR-closest guess on first
     /// contact from an address with no sticky history yet.
-    fn snapshot_ids(&self) -> Vec<(u16, NodeId)> {
-        self.identities.read().unwrap().iter().map(|(k, ctx)| (*k, ctx.node_id.clone())).collect()
+    async fn snapshot_ids(&self, is_v4: bool) -> Vec<(u16, NodeId)> {
+        let contexts: Vec<_> = self.identities.read().unwrap().iter()
+            .map(|(key, ctx)| (*key, ctx.clone())).collect();
+        let mut ids = Vec::new();
+        for (key, ctx) in contexts {
+            if let Some(stack) = if is_v4 { ctx.v4.as_ref() } else { ctx.v6.as_ref() } {
+                ids.push((key, ctx.sync_identity(stack).await));
+            }
+        }
+        ids
     }
 
     /// The identity `addr`'s traffic is currently associated with, if a live one exists -
@@ -604,6 +671,9 @@ async fn demux_and_handle(registry: &Registry, src: SocketAddr, buf: &[u8], is_v
         Ok(msg) if msg.message_type == "r" || msg.message_type == "e" => {
             match TransactionCounter::key_of(&msg.transaction_id).and_then(|key| registry.get(key).map(|ctx| (key, ctx))) {
                 Some((key, ctx)) => {
+                    if !ctx.transaction_counter.lock().await.pending_response(&msg.transaction_id, src) {
+                        return;
+                    }
                     registry.sticky_set_if_absent(src, key);
                     Some((key, ctx))
                 }
@@ -613,7 +683,7 @@ async fn demux_and_handle(registry: &Registry, src: SocketAddr, buf: &[u8], is_v
         Ok(msg) if msg.message_type == "q" => match registry.sticky_lookup(&src) {
             Some(hit) => Some(hit),
             None => {
-                let candidates = registry.snapshot_ids();
+                let candidates = registry.snapshot_ids(is_v4).await;
                 match guess_identity(&candidates, &msg.payload).and_then(|key| registry.get(key).map(|ctx| (key, ctx))) {
                     Some((key, ctx)) => {
                         registry.sticky_set_if_absent(src, key);
@@ -655,12 +725,12 @@ fn bind_v6_only(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 
 /// Bootstrap, warm-up (find nodes close to us), and the ongoing 30s maintenance tick
 /// (ping/refresh/save/get_peers-for-empty-info-hash), run once per active stack, forever.
-async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
-    let node_id = ctx.node_id.clone();
+async fn run_maintenance(ctx: DhtContext) {
     let transaction_counter = ctx.transaction_counter.clone();
 
     //Bootstrap, per stack
-    for stack in &stacks {
+    for stack in ctx.stacks() {
+        let node_id = ctx.sync_identity(stack).await;
         if stack.table.lock().await.nodes.len() == 0 {
             let want_v4 = stack.sock.local_addr().map(|a| a.is_ipv4()).unwrap_or(true);
 
@@ -696,7 +766,8 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
     }
 
     //Initial find_nodes to populate routing table, per stack
-    for stack in &stacks {
+    for stack in ctx.stacks() {
+        let node_id = ctx.sync_identity(stack).await;
         let node_list = stack.table.lock().await.get_random_nodes(10);
         for node in node_list {
             let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), Some(ctx.want_list()), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
@@ -711,10 +782,11 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
     }
 
     //Find closest nodes to us, per stack
-    for stack in &stacks {
+    for stack in ctx.stacks() {
         let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let mut last_nodes_count = stack.table.lock().await.nodes.len();
         loop {
+            let node_id = ctx.sync_identity(stack).await;
             let nodes = stack.table.lock().await.get_closest_nodes(&node_id, 5);
             for node in nodes {
                 let find_node = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), Some(ctx.want_list()), transaction_counter.lock().await.get_transaction_id(node.addr.clone()));
@@ -748,9 +820,19 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
     loop {
         interval.tick().await;
 
-        for stack in &stacks {
+        for stack in ctx.stacks() {
+            let node_id = ctx.sync_identity(stack).await;
             stack.table.lock().await.debug_stats();
             stack.table.lock().await.save();
+
+            if ctx.learns_address(stack) {
+                let neighbors = stack.table.lock().await.get_closest_nodes(&node_id, 3);
+                for node in neighbors {
+                    let tx = transaction_counter.lock().await.get_transaction_id(node.addr.clone());
+                    let query = proto::KRPCMessage::find_node(node_id.clone(), node_id.clone(), Some(ctx.want_list()), tx);
+                    let _ = stack.sock.send_to(&query.to_bencode().unwrap(), node.addr.socket_addr()).await;
+                }
+            }
 
             //Node management
             stack.table.lock().await.node_remove_dead();
@@ -807,6 +889,7 @@ async fn run_maintenance(ctx: DhtContext, stacks: Vec<Stack>) {
 pub struct DhtNodeConfig {
     pub bind_v4: Option<SocketAddr>,
     pub bind_v6: Option<SocketAddr>,
+    /// Explicit custom ID, used unchanged on both families. None enables BEP 42 generation.
     pub node_id: Option<NodeId>,
     //Persist this table's nodes to a file, reloaded on the next start with the same
     //node_id. None disables persistence (e.g. short-lived nodes with a rotating node_id,
@@ -847,6 +930,7 @@ impl Default for DhtNodeConfig {
 /// existing `DhtNodeConfig { bind_v4, bind_v6, ..DhtNodeConfig::new() }` call site is
 /// unaffected by this addition.
 pub struct NodeIdentityConfig {
+    /// Explicit custom ID, used unchanged on both families. None enables BEP 42 generation.
     pub node_id: Option<NodeId>,
     pub rt_v4_path: Option<String>,
     pub rt_v6_path: Option<String>,
@@ -873,39 +957,53 @@ impl Default for NodeIdentityConfig {
 /// used by both the receive-loop(s) and maintenance task. Used by both `DhtNode::start`
 /// (which binds fresh, exclusively-owned sockets first) and `DhtSocket::start_node`
 /// (which passes in sockets already shared with other identities).
-fn build_dht_context(
+async fn build_dht_context(
     identity: NodeIdentityConfig,
     v4_sock: Option<Arc<UdpSocket>>,
     v6_sock: Option<Arc<UdpSocket>>,
     transaction_counter: TransactionCounter,
-) -> (DhtContext, Vec<Stack>, mpsc::UnboundedReceiver<DhtEvent>) {
+    bep42: Bep42Config,
+    external: Arc<External>,
+) -> io::Result<(DhtContext, mpsc::UnboundedReceiver<DhtEvent>)> {
+    if identity.node_id.as_ref().is_some_and(|id| id.0.len() != 20) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "node ID must contain 20 bytes"));
+    }
+    let automatic = bep42.enabled && identity.node_id.is_none();
     let node_id = identity.node_id.unwrap_or_else(NodeId::generate_nodeid);
+    let addresses = external.addresses.lock().await;
+    let generation = external.generation.load(Ordering::Acquire);
+    let public_v4 = bep42.pinned(true).or(addresses.v4.current);
+    let public_v6 = bep42.pinned(false).or(addresses.v6.current);
+    drop(addresses);
     let invalid_ping_response_version = proto::Version::from_hex("4c540101");
 
     let v4 = v4_sock.map(|sock| {
-        let table = RoutingTable::load_or_new(Some(node_id.clone()), identity.rt_v4_path.as_deref());
-        Stack { sock, table: Arc::new(Mutex::new(table)) }
+        let mut id = node_id.clone();
+        if automatic { if let Some(ip) = public_v4 { bep42::secure_id(&mut id, ip); } }
+        let table = RoutingTable::load_or_new(Some(id.clone()), identity.rt_v4_path.as_deref());
+        Stack { sock, table: Arc::new(Mutex::new(table)), id: Arc::new(RwLock::new(id)), automatic, is_v4: true, applied: Arc::new(AtomicU64::new(generation)) }
     });
     let v6 = v6_sock.map(|sock| {
-        let table = RoutingTable::load_or_new(Some(node_id.clone()), identity.rt_v6_path.as_deref());
-        Stack { sock, table: Arc::new(Mutex::new(table)) }
+        let mut id = node_id.clone();
+        if automatic { if let Some(ip) = public_v6 { bep42::secure_id(&mut id, ip); } }
+        let table = RoutingTable::load_or_new(Some(id.clone()), identity.rt_v6_path.as_deref());
+        Stack { sock, table: Arc::new(Mutex::new(table)), id: Arc::new(RwLock::new(id)), automatic, is_v4: false, applied: Arc::new(AtomicU64::new(generation)) }
     });
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let ctx = DhtContext {
-        node_id,
         v4,
         v6,
         transaction_counter: Arc::new(Mutex::new(transaction_counter)),
         invalid_ping_response_version,
         event_tx,
         bootstrap_nodes: identity.bootstrap_nodes,
+        bep42,
+        external,
     };
 
-    let stacks: Vec<Stack> = ctx.v4.iter().chain(ctx.v6.iter()).cloned().collect();
-
-    (ctx, stacks, event_rx)
+    Ok((ctx, event_rx))
 }
 
 /// A UDP socket (per address family) shared by many [`DhtNode`] identities, each
@@ -921,6 +1019,8 @@ pub struct DhtSocket {
     v6: Option<Arc<UdpSocket>>,
     registry: Arc<Registry>,
     _handles: Vec<tokio::task::JoinHandle<()>>,
+    bep42: Bep42Config,
+    external: Arc<External>,
 }
 
 const STICKY_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
@@ -931,6 +1031,11 @@ impl DhtSocket {
     /// Binds the shared socket(s). At least one of `bind_v4`/`bind_v6` is required, same
     /// as `DhtNodeConfig`.
     pub async fn bind(bind_v4: Option<SocketAddr>, bind_v6: Option<SocketAddr>) -> io::Result<DhtSocket> {
+        Self::bind_with_bep42(bind_v4, bind_v6, Bep42Config::default()).await
+    }
+
+    /// Bind with explicit public addresses or an opt-out from automatic BEP 42 IDs.
+    pub async fn bind_with_bep42(bind_v4: Option<SocketAddr>, bind_v6: Option<SocketAddr>, bep42: Bep42Config) -> io::Result<DhtSocket> {
         if bind_v4.is_none() && bind_v6.is_none() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one of bind_v4/bind_v6 must be set"));
         }
@@ -968,7 +1073,7 @@ impl DhtSocket {
             }));
         }
 
-        Ok(DhtSocket { v4, v6, registry, _handles: handles })
+        Ok(DhtSocket { v4, v6, registry, _handles: handles, bep42, external: Arc::default() })
     }
 
     /// The actual bound IPv4 address/port, useful when binding to port 0 for an
@@ -987,8 +1092,7 @@ impl DhtSocket {
     /// the background, same as `DhtNode::start`; the returned `DhtNode::shutdown()`
     /// deregisters `key` in addition to stopping this identity's maintenance task.
     pub async fn start_node(&self, key: u16, identity: NodeIdentityConfig) -> io::Result<(DhtNode, mpsc::UnboundedReceiver<DhtEvent>)> {
-        let (ctx, stacks, event_rx) = build_dht_context(identity, self.v4.clone(), self.v6.clone(), TransactionCounter::new_multiplexed(key));
-        let node_id = ctx.node_id.clone();
+        let (ctx, event_rx) = build_dht_context(identity, self.v4.clone(), self.v6.clone(), TransactionCounter::new_multiplexed(key), self.bep42.clone(), self.external.clone()).await?;
         let ctx = Arc::new(ctx);
 
         self.registry.register(key, ctx.clone())?;
@@ -996,13 +1100,12 @@ impl DhtSocket {
         let mut handles = Vec::with_capacity(1);
         {
             let ctx = (*ctx).clone();
-            let stacks = stacks.clone();
             handles.push(tokio::spawn(async move {
-                run_maintenance(ctx, stacks).await;
+                run_maintenance(ctx).await;
             }));
         }
 
-        Ok((DhtNode { node_id, handles, stacks, dereg: Some((self.registry.clone(), key)) }, event_rx))
+        Ok((DhtNode::new(&ctx, handles, Some((self.registry.clone(), key))), event_rx))
     }
 }
 
@@ -1010,9 +1113,8 @@ impl DhtSocket {
 /// tasks keep running in the background for as long as the tokio runtime that spawned
 /// them is alive.
 pub struct DhtNode {
-    pub node_id: NodeId,
+    context: DhtContext,
     handles: Vec<tokio::task::JoinHandle<()>>,
-    stacks: Vec<Stack>,
     //Some((registry, key)) for a node started via DhtSocket::start_node - deregistered on
     //shutdown. None for DhtNode::start, which owns its socket(s) outright and has no
     //registry to deregister from.
@@ -1020,11 +1122,21 @@ pub struct DhtNode {
 }
 
 impl DhtNode {
+    fn new(context: &DhtContext, handles: Vec<tokio::task::JoinHandle<()>>, dereg: Option<(Arc<Registry>, u16)>) -> Self {
+        DhtNode { context: context.clone(), handles, dereg }
+    }
+
     /// Bind the configured socket(s), load/create routing tables, and start the node's
     /// background tasks (one receive loop per active address family, plus bootstrap/
     /// maintenance). Returns immediately once sockets are bound - bootstrap and warm-up
     /// happen in the background rather than blocking the caller.
     pub async fn start(config: DhtNodeConfig) -> io::Result<(DhtNode, mpsc::UnboundedReceiver<DhtEvent>)> {
+        Self::start_with_bep42(config, Bep42Config::default()).await
+    }
+
+    /// Start with optional pinned public IPv4/IPv6 addresses.
+    /// An explicitly supplied config.node_id always overrides automatic generation.
+    pub async fn start_with_bep42(config: DhtNodeConfig, bep42: Bep42Config) -> io::Result<(DhtNode, mpsc::UnboundedReceiver<DhtEvent>)> {
         if config.bind_v4.is_none() && config.bind_v6.is_none() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one of bind_v4/bind_v6 must be set"));
         }
@@ -1045,12 +1157,11 @@ impl DhtNode {
             bootstrap_nodes: config.bootstrap_nodes,
         };
 
-        let (ctx, stacks, event_rx) = build_dht_context(identity, v4_sock, v6_sock, TransactionCounter::new());
-        let node_id = ctx.node_id.clone();
+        let (ctx, event_rx) = build_dht_context(identity, v4_sock, v6_sock, TransactionCounter::new(), bep42, Arc::default()).await?;
 
-        let mut handles = Vec::with_capacity(stacks.len() + 1);
+        let mut handles = Vec::with_capacity(3);
 
-        for stack in &stacks {
+        for stack in ctx.stacks() {
             let stack = stack.clone();
             let ctx = ctx.clone();
             handles.push(tokio::spawn(async move {
@@ -1060,13 +1171,35 @@ impl DhtNode {
 
         {
             let ctx = ctx.clone();
-            let stacks = stacks.clone();
             handles.push(tokio::spawn(async move {
-                run_maintenance(ctx, stacks).await;
+                run_maintenance(ctx).await;
             }));
         }
 
-        Ok((DhtNode { node_id, handles, stacks, dereg: None }, event_rx))
+        Ok((DhtNode::new(&ctx, handles, None), event_rx))
+    }
+
+    /// Current identity (IPv4 if bound, otherwise IPv6), after applying any agreed
+    /// external-address change.
+    pub async fn node_id(&self) -> NodeId {
+        self.context.sync_identity(self.context.stacks().next().unwrap()).await
+    }
+
+    /// Current IPv4 identity, after applying any agreed external-address change.
+    pub async fn node_id_v4(&self) -> Option<NodeId> {
+        self.family_id(self.context.v4.as_ref()).await
+    }
+
+    /// Current IPv6 identity, independent of the IPv4 identity.
+    pub async fn node_id_v6(&self) -> Option<NodeId> {
+        self.family_id(self.context.v6.as_ref()).await
+    }
+
+    async fn family_id(&self, stack: Option<&Stack>) -> Option<NodeId> {
+        match stack {
+            Some(stack) => Some(self.context.sync_identity(stack).await),
+            None => None,
+        }
     }
 
     /// Stop this node's background tasks and release its socket(s) (or, for a node
@@ -1087,7 +1220,7 @@ impl DhtNode {
     /// node instead of the public bootstrap hosts.
     pub async fn known_addrs(&self) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
-        for stack in &self.stacks {
+        for stack in self.context.stacks() {
             let table = stack.table.lock().await;
             addrs.extend(table.nodes.values().map(|addr| addr.socket_addr()));
         }
@@ -1129,16 +1262,17 @@ mod tests {
 
     /// A minimal `DhtContext` for `Registry`/demux unit tests - no real sockets, since
     /// these tests never touch `v4`/`v6`.
-    fn test_ctx(node_id: NodeId) -> Arc<DhtContext> {
+    fn test_ctx() -> Arc<DhtContext> {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         Arc::new(DhtContext {
-            node_id,
             v4: None,
             v6: None,
             transaction_counter: Arc::new(Mutex::new(TransactionCounter::new())),
             invalid_ping_response_version: Version::from_hex("4c540101"),
             event_tx,
             bootstrap_nodes: Vec::new(),
+            bep42: Bep42Config::default(),
+            external: Arc::default(),
         })
     }
 
@@ -1190,7 +1324,7 @@ mod tests {
     #[test]
     fn test_registry_register_get_deregister() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
+        registry.register(1, test_ctx()).unwrap();
         assert!(registry.get(1).is_some());
         registry.deregister(1);
         assert!(registry.get(1).is_none());
@@ -1199,23 +1333,23 @@ mod tests {
     #[test]
     fn test_registry_register_twice_same_key_errors() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
-        assert!(registry.register(1, test_ctx(nid(2))).is_err());
+        registry.register(1, test_ctx()).unwrap();
+        assert!(registry.register(1, test_ctx()).is_err());
     }
 
     #[test]
     fn test_registry_deregister_then_reregister_succeeds() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
+        registry.register(1, test_ctx()).unwrap();
         registry.deregister(1);
-        assert!(registry.register(1, test_ctx(nid(2))).is_ok());
+        assert!(registry.register(1, test_ctx()).is_ok());
     }
 
     #[test]
     fn test_registry_sticky_set_if_absent_does_not_overwrite_live_key() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
-        registry.register(2, test_ctx(nid(2))).unwrap();
+        registry.register(1, test_ctx()).unwrap();
+        registry.register(2, test_ctx()).unwrap();
 
         let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         registry.sticky_set_if_absent(addr, 1);
@@ -1228,7 +1362,7 @@ mod tests {
     #[test]
     fn test_registry_sticky_entry_pointing_at_deregistered_key_is_treated_as_absent() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
+        registry.register(1, test_ctx()).unwrap();
 
         let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         registry.sticky_set_if_absent(addr, 1);
@@ -1237,7 +1371,7 @@ mod tests {
         assert!(registry.sticky_lookup(&addr).is_none());
 
         // The old sticky entry is now dead, so a newly-registered identity may claim it.
-        registry.register(2, test_ctx(nid(2))).unwrap();
+        registry.register(2, test_ctx()).unwrap();
         registry.sticky_set_if_absent(addr, 2);
         let (key, _) = registry.sticky_lookup(&addr).unwrap();
         assert_eq!(key, 2);
@@ -1246,11 +1380,106 @@ mod tests {
     #[test]
     fn test_registry_sweep_stale_sticky_removes_old_entries() {
         let registry = Registry::new();
-        registry.register(1, test_ctx(nid(1))).unwrap();
+        registry.register(1, test_ctx()).unwrap();
         let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         registry.sticky_set_if_absent(addr, 1);
 
         registry.sweep_stale_sticky(Duration::from_secs(0));
         assert!(registry.sticky_lookup(&addr).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bep42_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    async fn context(custom: Option<NodeId>, config: Bep42Config, external: Arc<External>) -> DhtContext {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ctx, _) = build_dht_context(
+            NodeIdentityConfig { node_id: custom, ..NodeIdentityConfig::new() },
+            Some(socket), None, TransactionCounter::new(), config, external,
+        ).await.unwrap();
+        ctx
+    }
+
+    async fn report(ctx: &DhtContext, src: &str, ip: &str, valid_transaction: bool) {
+        let src: SocketAddr = src.parse().unwrap();
+        let tx = if valid_transaction {
+            ctx.transaction_counter.lock().await.get_transaction_id(CompactAddress::new_from_sockaddr(src))
+        } else { proto::TransactionId::new(vec![0xff; 4]) };
+        let message = KRPCMessage::id_response(NodeId::generate_nodeid(), tx,
+            CompactAddress::new_from_sockaddr(SocketAddr::new(ip.parse().unwrap(), 6881)));
+        handle_packet(ctx, ctx.v4.as_ref().unwrap(), src, &message.to_bencode().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_changes_generated_ids_and_rebuilds_buckets_but_preserves_tokens() {
+        let external = Arc::<External>::default();
+        let ctx = context(None, Bep42Config::default(), external.clone()).await;
+        let own = ctx.v4.as_ref().unwrap();
+        let original = ctx.sync_identity(own).await;
+        let peer = NodeId::generate_nodeid();
+        let token = own.table.lock().await.generate_token(&peer);
+        for src in ["8.8.8.8:6881", "1.1.1.1:6881", "4.2.2.2:6881"] {
+            report(&ctx, src, "9.9.9.9", false).await;
+        }
+        assert_eq!(ctx.sync_identity(own).await, original);
+        for src in ["8.8.8.8:6881", "1.1.1.1:6881", "4.2.2.2:6881"] {
+            report(&ctx, src, "9.9.9.9", true).await;
+        }
+        let id = ctx.sync_identity(own).await;
+        assert!(bep42::matches_ip(&id, "9.9.9.9".parse().unwrap()));
+        let table = own.table.lock().await;
+        assert_eq!(table.node_id, id);
+        assert_eq!(table.buckets.my_node_id, id);
+        assert!(table.token_is_valid(&peer, &token));
+        drop(table);
+        // New identities sharing this socket inherit its agreed public address.
+        let other = context(None, Bep42Config::default(), external.clone()).await;
+        assert!(bep42::matches_ip(&other.sync_identity(other.v4.as_ref().unwrap()).await, "9.9.9.9".parse().unwrap()));
+        // Existing reporters change their votes when a VPN exit changes.
+        for src in ["8.8.8.8:6881", "1.1.1.1:6881", "4.2.2.2:6881"] {
+            report(&ctx, src, "9.9.9.10", true).await;
+        }
+        let updated = ctx.sync_identity(own).await;
+        assert!(bep42::matches_ip(&updated, "9.9.9.10".parse().unwrap()));
+        assert_ne!(updated, id);
+        assert!(bep42::matches_ip(&other.sync_identity(other.v4.as_ref().unwrap()).await, "9.9.9.10".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn custom_identity_is_never_rewritten_and_pinned_ip_ignores_reports() {
+        let config = Bep42Config { public_ipv4: Some("9.9.9.9".parse().unwrap()), ..Bep42Config::default() };
+        let custom = NodeId::new(vec![0xaa; 20]);
+        let ctx = context(Some(custom.clone()), config.clone(), Arc::default()).await;
+        for src in ["8.8.8.8:6881", "1.1.1.1:6881", "4.2.2.2:6881"] {
+            report(&ctx, src, "9.9.9.10", true).await;
+        }
+        assert_eq!(ctx.sync_identity(ctx.v4.as_ref().unwrap()).await, custom);
+        let ctx = context(None, config, Arc::default()).await;
+        for src in ["8.8.8.8:6881", "1.1.1.1:6881", "4.2.2.2:6881"] {
+            report(&ctx, src, "9.9.9.10", true).await;
+        }
+        assert!(bep42::matches_ip(&ctx.sync_identity(ctx.v4.as_ref().unwrap()).await, "9.9.9.9".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn families_have_independent_ids_and_registry_selects_the_right_family() {
+        let v4 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let v6 = Arc::new(UdpSocket::bind("[::1]:0").await.unwrap());
+        let ip4 = "9.9.9.9".parse().unwrap();
+        let ip6 = "2001:4860:4860::8888".parse().unwrap();
+        let (ctx, _) = build_dht_context(NodeIdentityConfig::new(), Some(v4), Some(v6), TransactionCounter::new(),
+            Bep42Config { public_ipv4: Some(ip4), public_ipv6: Some(ip6), ..Bep42Config::default() }, Arc::default()).await.unwrap();
+        let id4 = ctx.sync_identity(ctx.v4.as_ref().unwrap()).await;
+        let id6 = ctx.sync_identity(ctx.v6.as_ref().unwrap()).await;
+        assert!(bep42::matches_ip(&id4, IpAddr::V4(ip4)));
+        assert!(bep42::matches_ip(&id6, IpAddr::V6(ip6)));
+        assert_ne!(id4, id6);
+        let registry = Registry::new();
+        registry.register(0, Arc::new(ctx)).unwrap();
+        assert_eq!(registry.snapshot_ids(true).await, vec![(0, id4)]);
+        assert_eq!(registry.snapshot_ids(false).await, vec![(0, id6)]);
     }
 }
